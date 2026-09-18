@@ -39,14 +39,46 @@ struct SearchResponse {
 
 /// Search the public skill directory.
 pub fn search(query: &str, limit: u32) -> Result<Vec<SearchHit>, String> {
-    let url = format!(
-        "{SEARCH_URL}?q={}&limit={limit}",
-        urlencode(query)
-    );
+    let url = format!("{SEARCH_URL}?q={}&limit={limit}", urlencode(query));
     let body = get(&url)?;
     serde_json::from_str::<SearchResponse>(&body)
         .map(|r| r.skills)
         .map_err(|e| format!("could not read search results: {e}"))
+}
+
+/// Lifetime installs of one skill, according to skills.sh.
+///
+/// There is no per-skill endpoint, so this searches by name and picks the hit
+/// from the right source: popular names exist in many repositories.
+pub fn fetch_install_count(source: &str, name: &str) -> Result<Option<u64>, String> {
+    Ok(install_count(&search(name, 50)?, source, name))
+}
+
+/// The install count for `name` from `source` among search results.
+pub fn install_count(hits: &[SearchHit], source: &str, name: &str) -> Option<u64> {
+    let source = source.trim_end_matches(".git");
+    hits.iter()
+        .find(|hit| {
+            hit.source.eq_ignore_ascii_case(source)
+                && (hit.name == name || hit.skill_id.as_deref() == Some(name))
+        })
+        .map(|hit| hit.installs)
+}
+
+/// Compact display form: `950`, `60.6k`, `722k`, `1.2M`.
+pub fn format_count(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=99_999 => trim_decimal(n as f64 / 1_000., "k"),
+        100_000..=999_999 => format!("{}k", n / 1_000),
+        _ => trim_decimal(n as f64 / 1_000_000., "M"),
+    }
+}
+
+/// One decimal place, dropping a trailing `.0`.
+fn trim_decimal(value: f64, unit: &str) -> String {
+    let text = format!("{:.1}", (value * 10.).floor() / 10.);
+    format!("{}{unit}", text.trim_end_matches(".0"))
 }
 
 /// How risky one partner judged a skill to be.
@@ -266,6 +298,47 @@ mod tests {
     #[test]
     fn unrated_skills_report_unknown() {
         assert_eq!(SkillAudit::default().worst(), Risk::Unknown);
+    }
+
+    fn hit(name: &str, source: &str, installs: u64) -> SearchHit {
+        SearchHit {
+            name: name.into(),
+            source: source.into(),
+            skill_id: Some(name.into()),
+            installs,
+        }
+    }
+
+    #[test]
+    fn install_count_matches_the_source_not_just_the_name() {
+        // Popular names are published by many repositories.
+        let hits = [
+            hit("frontend-design", "someone-else/skills", 12),
+            hit("frontend-design", "anthropics/skills", 90_000),
+        ];
+        assert_eq!(
+            install_count(&hits, "anthropics/skills", "frontend-design"),
+            Some(90_000)
+        );
+        assert_eq!(
+            install_count(&hits, "anthropics/skills.git", "frontend-design"),
+            Some(90_000)
+        );
+        assert_eq!(
+            install_count(&hits, "unknown/repo", "frontend-design"),
+            None
+        );
+    }
+
+    #[test]
+    fn formats_counts_compactly() {
+        assert_eq!(format_count(950), "950");
+        assert_eq!(format_count(1_000), "1k");
+        assert_eq!(format_count(60_640), "60.6k");
+        // Rounds down, so a count never reads higher than it is.
+        assert_eq!(format_count(99_999), "99.9k");
+        assert_eq!(format_count(722_445), "722k");
+        assert_eq!(format_count(1_250_000), "1.2M");
     }
 
     #[test]

@@ -11,6 +11,19 @@ use skillshard::model::{Scope, UpdateState};
 use skillshard::ui::Skillshard;
 use std::path::{Path, PathBuf};
 
+/// Initialise the app with a fresh preferences file, so tests never read or
+/// write the user's own settings.
+fn init(cx: &mut TestAppContext) {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "skillshard-ui-prefs-{}-{n}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    cx.update(|cx| skillshard::ui::init(path, cx));
+}
+
 /// A throwaway project tree containing `names` as canonical skills.
 fn fixture(tag: &str, names: &[&str]) -> Scope {
     let root = std::env::temp_dir().join(format!("skillshard-ui-{tag}-{}", std::process::id()));
@@ -48,7 +61,7 @@ fn disabled(scope: &Scope, name: &str) -> PathBuf {
 
 #[gpui_kit::test]
 fn lists_every_skill_in_the_active_scope(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
+    init(cx);
     let scope = fixture("list", &["alpha", "beta"]);
 
     let handle = cx.open_window(size(px(1180.), px(760.)), |window, cx| {
@@ -58,8 +71,14 @@ fn lists_every_skill_in_the_active_scope(cx: &mut TestAppContext) {
 
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
-        assert!(window.try_find("row-alpha").is_some(), "alpha should be listed");
-        assert!(window.try_find("row-beta").is_some(), "beta should be listed");
+        assert!(
+            window.try_find("row-alpha").is_some(),
+            "alpha should be listed"
+        );
+        assert!(
+            window.try_find("row-beta").is_some(),
+            "beta should be listed"
+        );
         // Both start enabled, so their switches are on.
         assert_eq!(window.find("toggle-alpha").checked(), Some(true));
     })
@@ -68,7 +87,7 @@ fn lists_every_skill_in_the_active_scope(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn the_switch_disables_a_skill_on_disk_and_enables_it_again(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
+    init(cx);
     let scope = fixture("toggle", &["alpha"]);
     link(&scope, ".claude/skills", "alpha");
 
@@ -91,7 +110,10 @@ fn the_switch_disables_a_skill_on_disk_and_enables_it_again(cx: &mut TestAppCont
 
         // Disabling parks the files and takes them out of the agent's reach,
         // without uninstalling anything.
-        assert!(!canonical(&scope, "alpha").exists(), "canonical copy is moved");
+        assert!(
+            !canonical(&scope, "alpha").exists(),
+            "canonical copy is moved"
+        );
         assert!(disabled(&scope, "alpha").join("SKILL.md").is_file());
         assert!(!Path::new(&claude_link).exists(), "agent link is removed");
         assert_eq!(window.find("toggle-alpha").checked(), Some(false));
@@ -113,7 +135,7 @@ fn the_switch_disables_a_skill_on_disk_and_enables_it_again(cx: &mut TestAppCont
 
 #[gpui_kit::test]
 fn selecting_a_skill_reveals_its_agent_checkboxes(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
+    init(cx);
     let scope = fixture("detail", &["alpha"]);
     link(&scope, ".claude/skills", "alpha");
 
@@ -138,7 +160,7 @@ fn selecting_a_skill_reveals_its_agent_checkboxes(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn unchecking_an_agent_removes_only_that_agents_link(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
+    init(cx);
     let scope = fixture("agents", &["alpha"]);
     link(&scope, ".claude/skills", "alpha");
     link(&scope, ".windsurf/skills", "alpha");
@@ -174,7 +196,7 @@ fn unchecking_an_agent_removes_only_that_agents_link(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn the_install_dialog_opens_with_every_option_on_screen(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
+    init(cx);
     let scope = fixture("install", &["alpha"]);
     link(&scope, ".claude/skills", "alpha");
 
@@ -218,7 +240,7 @@ fn the_install_dialog_opens_with_every_option_on_screen(cx: &mut TestAppContext)
 
 #[gpui_kit::test]
 fn the_three_panes_are_laid_out_side_by_side(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
+    init(cx);
     let scope = fixture("layout", &["alpha"]);
     link(&scope, ".claude/skills", "alpha");
 
@@ -243,7 +265,10 @@ fn the_three_panes_are_laid_out_side_by_side(cx: &mut TestAppContext) {
         assert!(agent.size.width > px(0.), "detail has width");
 
         // Left to right: sidebar, then the list, then the detail pane.
-        assert!(row.left() >= sidebar.right(), "list sits right of the sidebar");
+        assert!(
+            row.left() >= sidebar.right(),
+            "list sits right of the sidebar"
+        );
         assert!(agent.left() >= row.right(), "detail sits right of the list");
 
         // The list starts below the header rather than under it.
@@ -260,10 +285,7 @@ fn open(
     scope: &Scope,
     width: f32,
     cx: &mut TestAppContext,
-) -> (
-    gpui_kit::WindowHandle<Root>,
-    gpui_kit::Entity<Skillshard>,
-) {
+) -> (gpui_kit::WindowHandle<Root>, gpui_kit::Entity<Skillshard>) {
     let scope = scope.clone();
     let mut view = None;
     let handle = cx.open_window(size(px(width), px(760.)), |window, cx| {
@@ -276,7 +298,7 @@ fn open(
 
 #[gpui_kit::test]
 fn the_on_off_switch_sits_at_the_end_of_the_row(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
+    init(cx);
     let scope = fixture("switch-side", &["alpha"]);
     let (handle, _view) = open(&scope, 1180., cx);
 
@@ -298,7 +320,7 @@ fn the_on_off_switch_sits_at_the_end_of_the_row(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn a_wide_list_labels_the_update_and_a_narrow_one_uses_an_arrow(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
+    init(cx);
     let scope = fixture("update-badge", &["alpha"]);
 
     // Wide window: there is room for the worded badge.
@@ -310,7 +332,10 @@ fn a_wide_list_labels_the_update_and_a_narrow_one_uses_an_arrow(cx: &mut TestApp
     });
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
-        assert!(window.try_find("update-tag-alpha").is_some(), "worded badge");
+        assert!(
+            window.try_find("update-tag-alpha").is_some(),
+            "worded badge"
+        );
         assert!(window.try_find("update-icon-alpha").is_none());
     })
     .unwrap();
@@ -324,7 +349,10 @@ fn a_wide_list_labels_the_update_and_a_narrow_one_uses_an_arrow(cx: &mut TestApp
     });
     cx.update_window(narrow_handle.into(), |_, window, cx| {
         window.render_frame(cx);
-        assert!(window.try_find("update-icon-alpha").is_some(), "arrow marker");
+        assert!(
+            window.try_find("update-icon-alpha").is_some(),
+            "arrow marker"
+        );
         assert!(window.try_find("update-tag-alpha").is_none());
     })
     .unwrap();
@@ -332,7 +360,7 @@ fn a_wide_list_labels_the_update_and_a_narrow_one_uses_an_arrow(cx: &mut TestApp
 
 #[gpui_kit::test]
 fn long_names_and_descriptions_stay_inside_the_row(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
+    init(cx);
     let root = std::env::temp_dir().join(format!("skillshard-ui-trunc-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let scope = Scope::Project(root);
@@ -360,4 +388,263 @@ fn long_names_and_descriptions_stay_inside_the_row(cx: &mut TestAppContext) {
         assert!(switch.size.width > px(0.), "switch is not squeezed away");
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_badge_collapses_when_the_list_is_narrow_even_with_nothing_selected(cx: &mut TestAppContext) {
+    // Regression: the detail pane is always on screen, but the width check
+    // only counted it once a skill was selected, overestimating the list.
+    init(cx);
+    let scope = fixture("badge-unselected", &["alpha"]);
+    let (handle, view) = open(&scope, 900., cx);
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            this.apply_update_states(vec![("alpha".into(), UpdateState::Available)], cx);
+        })
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let list = window.find("row-alpha").bounds().size.width;
+        assert!(
+            list < px(460.),
+            "fixture must leave a narrow list, got {list:?}"
+        );
+        assert!(
+            window.try_find("update-icon-alpha").is_some(),
+            "arrow marker"
+        );
+        assert!(window.try_find("update-tag-alpha").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn changing_preferences_re_themes_the_open_window(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("retheme", &["alpha"]);
+    let (_handle, _view) = open(&scope, 1180., cx);
+
+    cx.update(|cx| {
+        skillshard::preferences::update(cx, |p| {
+            p.appearance = skillshard::preferences::Appearance::Dark;
+            p.dark_theme = "Tokyo Night".into();
+        })
+    });
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let theme = gpui_kit::component::Theme::global(cx);
+        assert!(theme.is_dark());
+        assert_eq!(theme.theme_name().as_ref(), "Tokyo Night");
+    });
+}
+
+#[gpui_kit::test]
+fn the_settings_modal_opens_from_the_header_and_closes(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("settings", &["alpha"]);
+    let (handle, _view) = open(&scope, 1180., cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("open-settings", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("close-settings").is_some(), "modal is open");
+        window.click("close-settings", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("close-settings").is_none(), "modal closed");
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_install_dialog_starts_from_the_configured_defaults(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("defaults", &["alpha"]);
+    cx.update(|cx| {
+        skillshard::preferences::update(cx, |p| {
+            p.install_global = false;
+            p.install_copy = true;
+        })
+    });
+    let (handle, _view) = open(&scope, 1180., cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("install", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("scope").checked(),
+            Some(false),
+            "project by default"
+        );
+        assert_eq!(window.find("copy").checked(), Some(true), "copy by default");
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn local_repository_skills_are_listed_and_fill_the_form(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("local-install", &["alpha"]);
+    let repo = std::env::temp_dir().join(format!("skillshard-ui-repo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    let skill_dir = repo.join("skills/pdf-tools");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: pdf-tools\ndescription: Split PDFs\n---\n",
+    )
+    .unwrap();
+    cx.update(|cx| {
+        skillshard::preferences::update(cx, |p| p.local_repositories = vec![repo.clone()])
+    });
+    let (handle, _view) = open(&scope, 1180., cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("install", cx);
+    })
+    .unwrap();
+    // Discovery runs in the background.
+    cx.run_until_parked();
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("local-0", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("source").value(),
+            Some(skill_dir.display().to_string().as_str()),
+            "picking a local skill installs from its directory"
+        );
+    })
+    .unwrap();
+}
+
+/// A second fixture project, saved in preferences so it appears in the
+/// sidebar after the first.
+fn saved_project(tag: &str, skill: &str, cx: &mut TestAppContext) -> PathBuf {
+    let Scope::Project(root) = fixture(tag, &[skill]) else {
+        unreachable!()
+    };
+    cx.update(|cx| {
+        skillshard::preferences::update(cx, |p| {
+            p.project_mut(&root);
+        })
+    });
+    root
+}
+
+#[gpui_kit::test]
+fn sidebar_entries_are_left_aligned(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("align", &["alpha"]);
+    let (handle, _view) = open(&scope, 1180., cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let row = window.find("scope-0").bounds();
+        let label = window.find("scope-0-label").bounds();
+        // Icon plus padding, not half the row: centred text would start
+        // well over 100px in on a 300px sidebar.
+        assert!(
+            label.left() - row.left() < px(40.),
+            "label starts {:?} into the row",
+            label.left() - row.left()
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn saved_projects_are_restored_in_the_sidebar(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("restore-a", &["alpha"]);
+    saved_project("restore-b", "beta", cx);
+    let (handle, _view) = open(&scope, 1180., cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("scope-1", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("row-beta").is_some(),
+            "the saved project opens"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn project_settings_save_the_icon_and_colour(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("appearance-a", &["alpha"]);
+    let root = saved_project("appearance-b", "beta", cx);
+    let (handle, _view) = open(&scope, 1180., cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("project-settings-1", cx);
+        window.render_frame(cx);
+        // The settings button must not also select the project row it sits in.
+        assert!(
+            window.try_find("row-alpha").is_some(),
+            "selection unchanged"
+        );
+
+        window.click("icon-rocket", cx);
+        window.click("color-blue", cx);
+    })
+    .unwrap();
+
+    cx.update(|cx| {
+        let prefs = skillshard::preferences::get(cx);
+        let project = prefs.project(&root).expect("project is saved");
+        assert_eq!(project.icon.as_deref(), Some("rocket"));
+        assert_eq!(project.color.as_deref(), Some("blue"));
+    });
+}
+
+#[gpui_kit::test]
+fn removing_the_open_project_falls_back_and_keeps_its_files(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("remove-a", &["alpha"]);
+    let root = saved_project("remove-b", "beta", cx);
+    let (handle, _view) = open(&scope, 1180., cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("scope-1", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("row-beta").is_some());
+        window.click("project-settings-1", cx);
+        window.render_frame(cx);
+        window.click("remove-project", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("scope-1").is_none(),
+            "gone from the sidebar"
+        );
+        assert!(
+            window.try_find("row-alpha").is_some(),
+            "back on the first scope"
+        );
+        assert!(window.try_find("remove-project").is_none(), "modal closed");
+    })
+    .unwrap();
+    cx.update(|cx| assert!(skillshard::preferences::get(cx).project(&root).is_none()));
+    assert!(
+        root.join(".agents/skills/beta/SKILL.md").is_file(),
+        "removing a project never deletes its files"
+    );
 }

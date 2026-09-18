@@ -7,7 +7,9 @@
 //! the install button does anything.
 
 use crate::agents::Agent;
+use crate::local_repos::{self, LocalSkill};
 use crate::model::Scope;
+use crate::preferences;
 use crate::registry::{self, Risk, SearchHit, SkillAudit};
 use crate::skills_cli::InstallRequest;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -50,36 +52,60 @@ pub struct InstallDialog {
     global: bool,
     copy: bool,
     results: Lookup<Vec<SearchHit>>,
+    /// Skills found in the configured local repositories, and any roots that
+    /// could not be read.
+    local: Lookup<(Vec<LocalSkill>, Vec<String>)>,
     audit: Lookup<BTreeMap<String, SkillAudit>>,
     /// Set once the user has seen a review for the current source.
     reviewed_source: Option<String>,
 }
 
 impl InstallDialog {
-    pub fn new(
-        scope: &Scope,
-        agents: Vec<&'static Agent>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    /// `agents` are those already in use; the rest of the defaults come from
+    /// preferences.
+    pub fn new(agents: Vec<&'static Agent>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let source = cx.new(|cx| {
             InputState::new(window, cx).placeholder("owner/repo, a URL, or a local path")
         });
         let skills = cx.new(|cx| {
             InputState::new(window, cx).placeholder("all skills (or a comma-separated list)")
         });
-        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search skills.sh…"));
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search skills…"));
+        // Local results filter as you type; remote ones wait for "Search".
+        cx.observe(&query, |_, _, cx| cx.notify()).detach();
+
+        let prefs = preferences::get(cx).clone();
+        let roots = prefs.local_repositories.clone();
+        let has_roots = !roots.is_empty();
+        if has_roots {
+            // A repository can be a large tree; walk it off the UI thread.
+            cx.spawn(async move |this, cx| {
+                let found = cx
+                    .background_executor()
+                    .spawn(async move { local_repos::discover(&roots) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.local = Lookup::Ready(found);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
 
         Self {
             source,
             skills,
             query,
-            // Default to the agents already in use, which is almost always
-            // what the user wants and avoids creating stray directories.
-            agents: agents.into_iter().map(|a| (a, true)).collect(),
-            global: scope.is_global(),
-            copy: false,
+            agents: default_agents(agents, &prefs.install_agents),
+            global: prefs.install_global,
+            copy: prefs.install_copy,
             results: Lookup::Idle,
+            local: if has_roots {
+                Lookup::Loading
+            } else {
+                Lookup::Idle
+            },
             audit: Lookup::Idle,
             reviewed_source: None,
         }
@@ -139,6 +165,13 @@ impl InstallDialog {
         if source.is_empty() {
             return;
         }
+        if std::path::Path::new(&source).exists() {
+            self.audit = Lookup::Failed(
+                "local skills are not audited by skills.sh — read them before installing".into(),
+            );
+            cx.notify();
+            return;
+        }
         let names = self.skill_names(cx);
         self.audit = Lookup::Loading;
         self.reviewed_source = Some(source.clone());
@@ -181,6 +214,47 @@ impl InstallDialog {
     }
 }
 
+/// Agents offered in the dialog, and which start ticked.
+///
+/// With no preferred agents every agent already in use is ticked, which is
+/// almost always what the user wants and avoids creating stray directories.
+/// Preferred agents are offered even when not yet in use.
+fn default_agents(
+    in_use: Vec<&'static Agent>,
+    preferred: &[String],
+) -> Vec<(&'static Agent, bool)> {
+    let mut offered = in_use;
+    for agent in preferred
+        .iter()
+        .filter_map(|key| crate::agents::by_key(key))
+    {
+        if !offered.iter().any(|a| a.key == agent.key) {
+            offered.push(agent);
+        }
+    }
+    offered.sort_by_key(|a| a.display);
+    offered
+        .into_iter()
+        .map(|agent| {
+            let ticked = preferred.is_empty() || preferred.iter().any(|k| k == agent.key);
+            (agent, ticked)
+        })
+        .collect()
+}
+
+/// Local skills whose name or description contains `query`.
+fn matching_local<'a>(skills: &'a [LocalSkill], query: &str) -> Vec<&'a LocalSkill> {
+    let query = query.trim().to_lowercase();
+    skills
+        .iter()
+        .filter(|s| {
+            query.is_empty()
+                || s.name.to_lowercase().contains(&query)
+                || s.description.to_lowercase().contains(&query)
+        })
+        .collect()
+}
+
 /// Colour a risk verdict.
 fn risk_tag(risk: Risk) -> Tag {
     match risk {
@@ -193,70 +267,127 @@ fn risk_tag(risk: Risk) -> Tag {
 }
 
 impl InstallDialog {
+    /// Fill the form from a picked result.
+    fn pick(&mut self, source: String, skill: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.source
+            .update(cx, |state, cx| state.set_value(source, window, cx));
+        self.skills
+            .update(cx, |state, cx| state.set_value(skill, window, cx));
+        self.audit = Lookup::Idle;
+        self.reviewed_source = None;
+        cx.notify();
+    }
+
     fn render_search(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
-            .gap_2()
+            .gap_3()
             .child(
                 h_flex()
                     .gap_2()
-                    .child(Input::new(&self.query).id("install-query").flex_1())
+                    .child(Input::new(&self.query).id("install-query").small().flex_1())
                     .child(
                         Button::new("do-search")
-                            .label("Search")
+                            .small()
+                            .label("Search skills.sh")
                             .on_click(cx.listener(|this, _, _, cx| this.search(cx))),
                     ),
             )
-            .child(match &self.results {
+            .when(!matches!(self.local, Lookup::Idle), |this| {
+                this.child(self.render_local(cx))
+            })
+            .child(self.render_remote(cx))
+    }
+
+    fn render_local(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let query = self.query.read(cx).value().to_string();
+        v_flex()
+            .id("local-results")
+            .gap_1()
+            .child(result_heading("Local repositories", cx))
+            .child(match &self.local {
                 Lookup::Idle => div().into_any_element(),
-                Lookup::Loading => h_flex()
-                    .gap_2()
-                    .child(Spinner::new().small())
-                    .child("Searching…")
-                    .into_any_element(),
+                Lookup::Loading => loading("Looking through folders…"),
                 Lookup::Failed(e) => div()
-                    .text_sm()
+                    .text_xs()
                     .text_color(cx.theme().danger)
                     .child(e.clone())
                     .into_any_element(),
+                Lookup::Ready((skills, errors)) => {
+                    let matches = matching_local(skills, &query);
+                    v_flex()
+                        .id("local-list")
+                        .max_h(px(140.))
+                        .overflow_y_scroll()
+                        .children(errors.iter().map(|e| {
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .child(e.clone())
+                        }))
+                        .when(matches.is_empty() && errors.is_empty(), |this| {
+                            this.child(empty_note("No local skills match.", cx))
+                        })
+                        .children(
+                            matches
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, skill)| {
+                                    let path = skill.path.display().to_string();
+                                    result_row(
+                                        SharedString::from(format!("local-{index}")),
+                                        skill.name.clone(),
+                                        crate::paths::shorten(&skill.path),
+                                        None,
+                                        cx,
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        // A skill directory installs as a whole.
+                                        this.pick(path.clone(), String::new(), window, cx)
+                                    }))
+                                    .test_support()
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .into_any_element()
+                }
+            })
+    }
+
+    fn render_remote(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_1()
+            .child(result_heading("skills.sh", cx))
+            .child(match &self.results {
+                Lookup::Idle => empty_note("Search the public directory.", cx).into_any_element(),
+                Lookup::Loading => loading("Searching…"),
+                Lookup::Failed(e) => div()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(e.clone())
+                    .into_any_element(),
+                Lookup::Ready(hits) if hits.is_empty() => {
+                    empty_note("Nothing found.", cx).into_any_element()
+                }
                 Lookup::Ready(hits) => v_flex()
                     .id("results")
-                    .max_h(px(160.))
+                    .max_h(px(180.))
                     .overflow_y_scroll()
                     .children(
                         hits.iter()
                             .enumerate()
                             .map(|(index, hit)| {
-                                let source = hit.source.clone();
-                                let name = hit.name.clone();
-                                h_flex()
-                                    .id(("hit", index))
-                                    .w_full()
-                                    .px_2()
-                                    .py_1()
-                                    .gap_2()
-                                    .items_center()
-                                    .rounded(cx.theme().radius)
-                                    .hover(|s| s.bg(cx.theme().list_hover))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        // Picking a result fills in both the
-                                        // source and the single skill to install.
-                                        this.source.update(cx, |state, cx| {
-                                            state.set_value(source.clone(), window, cx)
-                                        });
-                                        this.skills.update(cx, |state, cx| {
-                                            state.set_value(name.clone(), window, cx)
-                                        });
-                                        this.audit = Lookup::Idle;
-                                        this.reviewed_source = None;
-                                        cx.notify();
-                                    }))
-                                    .child(div().flex_1().text_sm().child(hit.name.clone()))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(hit.source.clone()),
-                                    )
+                                let (source, name) = (hit.source.clone(), hit.name.clone());
+                                result_row(
+                                    SharedString::from(format!("hit-{index}")),
+                                    hit.name.clone(),
+                                    hit.source.clone(),
+                                    Some(hit.installs),
+                                    cx,
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.pick(source.clone(), name.clone(), window, cx)
+                                }))
+                                .test_support()
                             })
                             .collect::<Vec<_>>(),
                     )
@@ -360,8 +491,16 @@ impl Render for InstallDialog {
                     .child(div().text_lg().font_semibold().child("Install a skill"))
                     .child(self.render_search(cx))
                     .child(Separator::horizontal())
-                    .child(labelled("Source", Input::new(&self.source).id("source"), cx))
-                    .child(labelled("Skills", Input::new(&self.skills).id("skills"), cx))
+                    .child(labelled(
+                        "Source",
+                        Input::new(&self.source).id("source"),
+                        cx,
+                    ))
+                    .child(labelled(
+                        "Skills",
+                        Input::new(&self.skills).id("skills"),
+                        cx,
+                    ))
                     .child(
                         h_flex()
                             .gap_4()
@@ -429,9 +568,9 @@ impl Render for InstallDialog {
                             .gap_2()
                             .justify_end()
                             .child(
-                                Button::new("cancel").label("Cancel").on_click(cx.listener(
-                                    |_, _, _, cx| cx.emit(InstallEvent::Cancel),
-                                )),
+                                Button::new("cancel").label("Cancel").on_click(
+                                    cx.listener(|_, _, _, cx| cx.emit(InstallEvent::Cancel)),
+                                ),
                             )
                             .child(
                                 Button::new("confirm")
@@ -445,6 +584,73 @@ impl Render for InstallDialog {
     }
 }
 
+/// A clickable search result: name, where it comes from, and its installs.
+fn result_row(
+    id: SharedString,
+    name: String,
+    origin: String,
+    installs: Option<u64>,
+    cx: &App,
+) -> Stateful<Div> {
+    h_flex()
+        .id(id)
+        .w_full()
+        .px_2()
+        .py_1()
+        .gap_3()
+        .items_center()
+        .rounded(cx.theme().radius)
+        .hover(|s| s.bg(cx.theme().list_hover))
+        .child(div().flex_1().min_w_0().text_sm().truncate().child(name))
+        .child(
+            div()
+                .max_w(px(220.))
+                .text_xs()
+                .truncate()
+                .text_color(cx.theme().muted_foreground)
+                .child(origin),
+        )
+        .when_some(installs, |this, count| {
+            this.child(
+                h_flex()
+                    .w(px(56.))
+                    .justify_end()
+                    .gap_1()
+                    .items_center()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(Icon::empty().path("icons/download.svg").xsmall())
+                    .child(registry::format_count(count)),
+            )
+        })
+}
+
+fn result_heading(text: &str, cx: &App) -> impl IntoElement {
+    div()
+        .text_xs()
+        .font_medium()
+        .text_color(cx.theme().muted_foreground)
+        .child(text.to_uppercase())
+}
+
+fn empty_note(text: &str, cx: &App) -> impl IntoElement {
+    div()
+        .px_2()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(text.to_string())
+}
+
+fn loading(text: &'static str) -> AnyElement {
+    h_flex()
+        .px_2()
+        .gap_2()
+        .text_xs()
+        .child(Spinner::new().xsmall())
+        .child(text)
+        .into_any_element()
+}
+
 /// A labelled form row.
 fn labelled(label: &str, control: impl IntoElement, cx: &App) -> impl IntoElement {
     v_flex()
@@ -456,4 +662,61 @@ fn labelled(label: &str, control: impl IntoElement, cx: &App) -> impl IntoElemen
                 .child(label.to_string()),
         )
         .child(control)
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: the kit's glob export includes GPUI's `test` macro when
+    // test support is on, which would shadow `#[test]`.
+    use super::{default_agents, matching_local};
+    use crate::agents::{by_key, Agent};
+    use crate::local_repos::LocalSkill;
+    use std::path::PathBuf;
+
+    fn keys(selection: &[(&'static Agent, bool)]) -> Vec<(&'static str, bool)> {
+        selection.iter().map(|(a, on)| (a.key, *on)).collect()
+    }
+
+    #[test]
+    fn with_no_preference_every_agent_in_use_is_ticked() {
+        let in_use = vec![by_key("claude-code").unwrap(), by_key("codex").unwrap()];
+        assert_eq!(
+            keys(&default_agents(in_use, &[])),
+            [("claude-code", true), ("codex", true)]
+        );
+    }
+
+    #[test]
+    fn preferred_agents_are_ticked_and_offered_even_if_not_in_use() {
+        let in_use = vec![by_key("claude-code").unwrap(), by_key("codex").unwrap()];
+        let preferred = ["codex".to_string(), "windsurf".to_string()];
+        assert_eq!(
+            keys(&default_agents(in_use, &preferred)),
+            [("claude-code", false), ("codex", true), ("windsurf", true)]
+        );
+    }
+
+    #[test]
+    fn local_matches_name_or_description_ignoring_case() {
+        let skill = |name: &str, description: &str| LocalSkill {
+            name: name.into(),
+            description: description.into(),
+            path: PathBuf::from(name),
+            repository: PathBuf::from("/repo"),
+        };
+        let skills = [
+            skill("pdf-tools", "Split PDFs"),
+            skill("git-helper", "Commit messages"),
+        ];
+        let names = |q: &str| -> Vec<String> {
+            matching_local(&skills, q)
+                .iter()
+                .map(|s| s.name.clone())
+                .collect()
+        };
+        assert_eq!(names(""), ["pdf-tools", "git-helper"]);
+        assert_eq!(names("PDF"), ["pdf-tools"]);
+        assert_eq!(names("commit"), ["git-helper"]);
+        assert!(names("nothing").is_empty());
+    }
 }

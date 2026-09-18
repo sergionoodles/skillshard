@@ -7,14 +7,18 @@
 //! scope.
 
 pub mod agents;
+pub mod assets;
 pub mod frontmatter;
+pub mod local_repos;
 pub mod lock;
 pub mod model;
 pub mod ops;
 pub mod paths;
+pub mod preferences;
 pub mod registry;
 pub mod scan;
 pub mod skills_cli;
 pub mod state;
+pub mod themes;
 pub mod ui;
 pub mod updates;

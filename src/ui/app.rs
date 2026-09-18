@@ -3,7 +3,7 @@
 use crate::agents::Agent;
 use crate::model::{InstallKind, Scope, Skill, UpdateState};
 use crate::skills_cli::{self, Launcher};
-use crate::{ops, paths, scan, updates};
+use crate::{assets, ops, paths, preferences, registry, scan, themes, updates};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputState};
@@ -15,11 +15,10 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use std::collections::{HashMap, HashSet};
 
-/// Width of the scope sidebar.
-const SIDEBAR_WIDTH: f32 = 240.;
-/// Width of the detail pane, when a skill is selected.
-const DETAIL_WIDTH: f32 = 360.;
+/// Width of both side panes: the scope sidebar and the detail pane.
+const SIDE_PANE_WIDTH: f32 = 300.;
 /// Below this, the list column loses the worded update badge and shows an
 /// arrow instead.
 const COMPACT_LIST_WIDTH: f32 = 460.;
@@ -43,6 +42,18 @@ pub struct Skillshard {
     busy: Option<SharedString>,
     launcher: Launcher,
     install: Option<Entity<super::install::InstallDialog>>,
+    settings: Option<Entity<super::settings::SettingsDialog>>,
+    project_settings: Option<Entity<super::project_settings::ProjectSettingsDialog>>,
+    /// skills.sh install counts, keyed by [`install_key`].
+    installs: HashMap<String, u64>,
+    /// Counts already asked for, so re-scans do not repeat in-flight lookups.
+    installs_requested: HashSet<String>,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// Identifies a skill on skills.sh: the same name can come from many sources.
+fn install_key(source: &str, name: &str) -> String {
+    format!("{source}/{name}")
 }
 
 impl Skillshard {
@@ -52,10 +63,33 @@ impl Skillshard {
         Self::with_scopes(vec![Scope::Global], window, cx)
     }
 
-    /// Start on a specific set of scopes. Used by the UI tests to point the
-    /// window at a fixture tree instead of the real home directory.
-    pub fn with_scopes(scopes: Vec<Scope>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// Start on a specific set of scopes, followed by the projects saved in
+    /// preferences. The UI tests use this to point the window at a fixture
+    /// tree instead of the real home directory.
+    pub fn with_scopes(
+        mut scopes: Vec<Scope>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        for project in &preferences::get(cx).projects {
+            let scope = Scope::Project(project.path.clone());
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+        }
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search skills…"));
+        themes::apply(window, cx);
+        let subscriptions = vec![
+            // Only matters while the appearance preference is "system", but
+            // `apply` already knows that.
+            window.observe_window_appearance(themes::apply),
+            cx.observe_global_in::<preferences::Store>(window, |this, window, cx| {
+                themes::apply(window, cx);
+                this.report_preferences_error(cx);
+                cx.notify();
+            }),
+        ];
+
         let mut this = Self {
             scopes,
             active_scope: 0,
@@ -66,9 +100,75 @@ impl Skillshard {
             busy: None,
             launcher: Launcher::detect(),
             install: None,
+            settings: None,
+            project_settings: None,
+            installs: HashMap::new(),
+            installs_requested: HashSet::new(),
+            _subscriptions: subscriptions,
         };
+        this.report_preferences_error(cx);
         this.reload(cx);
+        if preferences::get(cx).check_updates_on_startup {
+            this.check_updates(cx);
+        }
         this
+    }
+
+    /// Surface a failure to read or save preferences, once.
+    fn report_preferences_error(&mut self, cx: &mut Context<Self>) {
+        if cx.global::<preferences::Store>().error.is_none() {
+            return;
+        }
+        if let Some(error) = cx.global_mut::<preferences::Store>().error.take() {
+            self.log(format!("settings: {error}"), true);
+        }
+    }
+
+    /// Look up skills.sh install counts for tracked skills not yet known.
+    fn fetch_install_counts(&mut self, cx: &mut Context<Self>) {
+        for skill in &self.skills {
+            let Some(lock) = &skill.lock else {
+                continue;
+            };
+            let key = install_key(&lock.source, &skill.name);
+            if !self.installs_requested.insert(key.clone()) {
+                continue;
+            }
+            let (source, name) = (lock.source.clone(), skill.name.clone());
+            // One task per skill: each lookup is a full search, and doing them
+            // one after another takes seconds.
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { registry::fetch_install_count(&source, &name) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    match result {
+                        Ok(Some(count)) => {
+                            this.installs.insert(key, count);
+                        }
+                        // Not every source is listed on skills.sh.
+                        Ok(None) => {}
+                        Err(e) => {
+                            // Allow a later re-scan to try again.
+                            this.installs_requested.remove(&key);
+                            this.log(format!("install counts unavailable: {e}"), true);
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    /// The skills.sh install count for `skill`, when known.
+    fn install_count(&self, skill: &Skill) -> Option<u64> {
+        let lock = skill.lock.as_ref()?;
+        self.installs
+            .get(&install_key(&lock.source, &skill.name))
+            .copied()
     }
 
     /// The scope currently being shown.
@@ -85,6 +185,7 @@ impl Skillshard {
                 self.selected = None;
             }
         }
+        self.fetch_install_counts(cx);
         cx.notify();
     }
 
@@ -368,37 +469,59 @@ impl Skillshard {
             .filter(|s| s.update == UpdateState::Available)
             .count();
 
+        // Left and right sections share the leftover space equally, which is
+        // what keeps the search box truly centred.
         h_flex()
             .w_full()
             .px_4()
-            .py_3()
-            .gap_3()
+            .py_2()
+            .gap_4()
             .items_center()
             .border_b_1()
             .border_color(cx.theme().border)
+            .child(h_flex().flex_1().flex_basis(px(0.)).child(wordmark(cx)))
+            .child(Input::new(&self.search).id("search").small().w(px(360.)))
             .child(
-                div()
-                    .font_semibold()
-                    .text_lg()
-                    .child("Skillshard"),
-            )
-            .child(Input::new(&self.search).id("search").w(px(280.)))
-            .child(div().flex_1())
-            .when(updatable > 0, |this| {
-                this.child(Tag::warning().child(format!("{updatable} to update")))
-            })
-            .child(
-                Button::new("check-updates")
-                    .label("Check updates")
-                    .disabled(self.busy.is_some())
-                    .on_click(cx.listener(|this, _, _, cx| this.check_updates(cx))),
-            )
-            .child(
-                Button::new("install")
-                    .primary()
-                    .label("Install skill")
-                    .disabled(self.busy.is_some())
-                    .on_click(cx.listener(|this, _, window, cx| this.open_install(window, cx))),
+                h_flex()
+                    .flex_1()
+                    .flex_basis(px(0.))
+                    .justify_end()
+                    .gap_2()
+                    .when(updatable > 0, |this| {
+                        this.child(
+                            Tag::warning()
+                                .small()
+                                .child(format!("{updatable} to update")),
+                        )
+                    })
+                    .child(
+                        Button::new("check-updates")
+                            .small()
+                            .ghost()
+                            .label("Check updates")
+                            .disabled(self.busy.is_some())
+                            .on_click(cx.listener(|this, _, _, cx| this.check_updates(cx))),
+                    )
+                    .child(
+                        Button::new("install")
+                            .small()
+                            .primary()
+                            .label("Install skill")
+                            .disabled(self.busy.is_some())
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_install(window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("open-settings")
+                            .small()
+                            .ghost()
+                            .icon(IconName::Settings)
+                            .tooltip("Settings")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
+                            ),
+                    ),
             )
     }
 
@@ -406,67 +529,112 @@ impl Skillshard {
         let enabled = self.skills.iter().filter(|s| !s.disabled).count();
         let disabled = self.skills.len() - enabled;
 
+        let mut items: Vec<AnyElement> = Vec::new();
+        for (index, scope) in self.scopes.iter().enumerate() {
+            items.push(self.render_scope_item(index, scope, cx).into_any_element());
+            // Global stands apart from the projects listed under it.
+            if scope.is_global() {
+                items.push(
+                    div()
+                        .py_1()
+                        .child(Separator::horizontal())
+                        .into_any_element(),
+                );
+            }
+        }
+
         v_flex()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(SIDE_PANE_WIDTH))
+            .flex_shrink_0()
             .h_full()
             .p_3()
-            .gap_1()
+            .gap_0p5()
             .border_r_1()
             .border_color(cx.theme().border)
+            .child(section_label("Scope", cx))
+            .children(items)
             .child(
-                div()
-                    .text_xs()
+                nav_row("open-project", cx)
                     .text_color(cx.theme().muted_foreground)
-                    .pb_1()
-                    .child("SCOPE"),
-            )
-            .children(
-                self.scopes
-                    .iter()
-                    .enumerate()
-                    .map(|(index, scope)| {
-                        let active = index == self.active_scope;
-                        Button::new(SharedString::from(format!("scope-{index}")))
-                            .w_full()
-                            .justify_start()
-                            .label(scope.label())
-                            .when(active, |b| b.primary())
-                            .when(!active, |b| b.ghost())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.active_scope = index;
-                                this.selected = None;
-                                this.reload(cx);
-                            }))
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .child(
-                Button::new("open-project")
-                    .w_full()
-                    .justify_start()
-                    .ghost()
-                    .label("Add project…")
-                    .on_click(cx.listener(|this, _, window, cx| this.pick_project(window, cx))),
-            )
-            .child(div().h_2())
-            .child(Separator::horizontal())
-            .child(div().h_2())
-            .child(
-                v_flex()
-                    .gap_1()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!("{enabled} enabled"))
-                    .child(format!("{disabled} disabled"))
-                    .child(format!("{} agents in use", self.in_use_agents().len())),
+                    .child(Icon::empty().path("icons/folder-plus.svg").small())
+                    .child("Add project…")
+                    .on_click(cx.listener(|this, _, window, cx| this.pick_project(window, cx)))
+                    .test_support(),
             )
             .child(div().flex_1())
             .child(
-                div()
+                v_flex()
+                    .gap_0p5()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(paths::shorten(&self.scope().canonical_dir())),
+                    .child(format!(
+                        "{enabled} enabled · {disabled} disabled · {}",
+                        plural(self.in_use_agents().len(), "agent")
+                    ))
+                    .child(
+                        div()
+                            .truncate()
+                            .child(paths::shorten(&self.scope().canonical_dir())),
+                    ),
             )
+    }
+
+    /// A sidebar entry for one scope: its icon, name and, for projects, a
+    /// button to the project's settings.
+    fn render_scope_item(
+        &self,
+        index: usize,
+        scope: &Scope,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = index == self.active_scope;
+        let (icon, tint) = match scope {
+            Scope::Global => (Icon::new(IconName::Globe), None),
+            Scope::Project(path) => {
+                let project = preferences::get(cx).project(path);
+                (
+                    super::project_settings::icon(project),
+                    super::project_settings::color(project, cx),
+                )
+            }
+        };
+
+        nav_row(SharedString::from(format!("scope-{index}")), cx)
+            .when(active, |this| this.bg(cx.theme().list_active).font_medium())
+            .child(
+                icon.small()
+                    .text_color(tint.unwrap_or(cx.theme().muted_foreground)),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("scope-{index}-label")))
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(scope.label())
+                    .test_support(),
+            )
+            .when(!scope.is_global(), |this| {
+                this.child(
+                    Button::new(SharedString::from(format!("project-settings-{index}")))
+                        .xsmall()
+                        .ghost()
+                        .icon(Icon::empty().path("icons/ellipsis.svg"))
+                        .tooltip("Project settings")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // The button sits inside the row; without this
+                            // the click would also select the project.
+                            cx.stop_propagation();
+                            this.open_project_settings(index, cx)
+                        })),
+                )
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.active_scope = index;
+                this.selected = None;
+                this.reload(cx);
+            }))
+            .test_support()
     }
 
     /// One row in the skill list.
@@ -484,13 +652,14 @@ impl Skillshard {
         let agent_count = skill.installs.len();
         let missing = skill.canonical.is_none() && skill.installs.is_empty();
         let needs_update = skill.update == UpdateState::Available;
+        let installs = self.install_count(skill);
 
         h_flex()
             .id(SharedString::from(format!("row-{}", skill.name)))
             .w_full()
-            .px_3()
+            .px_4()
             .py_2()
-            .gap_3()
+            .gap_4()
             .items_center()
             .border_b_1()
             .border_color(cx.theme().border)
@@ -557,11 +726,32 @@ impl Skillshard {
                     ),
             )
             .child(
-                div()
+                h_flex()
                     .flex_shrink_0()
+                    .gap_3()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(format!("{agent_count} agents")),
+                    .when_some(installs, |this, count| {
+                        this.child(
+                            h_flex()
+                                .id(SharedString::from(format!("installs-{}", skill.name)))
+                                .gap_1()
+                                .items_center()
+                                .child(Icon::empty().path("icons/download.svg").xsmall())
+                                .child(registry::format_count(count))
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("Installs on skills.sh").build(window, cx)
+                                })
+                                .test_support(),
+                        )
+                    })
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(Icon::new(IconName::Bot).xsmall())
+                            .child(plural(agent_count, "agent")),
+                    ),
             )
             // The on/off switch sits at the trailing edge of the row.
             .child(
@@ -609,7 +799,7 @@ impl Skillshard {
     fn render_detail(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(skill) = self.selected_skill().cloned() else {
             return v_flex()
-                .w(px(DETAIL_WIDTH))
+                .w(px(SIDE_PANE_WIDTH))
                 .h_full()
                 .p_4()
                 .border_l_1()
@@ -638,7 +828,7 @@ impl Skillshard {
 
         v_flex()
             .id("detail")
-            .w(px(DETAIL_WIDTH))
+            .w(px(SIDE_PANE_WIDTH))
             .h_full()
             .p_4()
             .gap_3()
@@ -787,6 +977,13 @@ impl Skillshard {
             .gap_1()
             .text_sm()
             .child(meta_row("Source", skill.source_label().to_string(), cx))
+            .when_some(self.install_count(skill), |this, count| {
+                this.child(meta_row(
+                    "Installs",
+                    format!("{} on skills.sh", registry::format_count(count)),
+                    cx,
+                ))
+            })
             .child(meta_row("Updates", update_text, cx))
             .child(meta_row("Location", location, cx))
             .child(meta_row(
@@ -810,7 +1007,7 @@ impl Skillshard {
             .items_center()
             .border_t_1()
             .border_color(cx.theme().border)
-            .text_sm()
+            .text_xs()
             .when_some(self.busy.clone(), |this, label| {
                 this.child(Spinner::new().small()).child(label)
             })
@@ -823,9 +1020,7 @@ impl Skillshard {
                             cx.theme().muted_foreground
                         })
                         .child(entry.text.clone()),
-                    None => div()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Ready"),
+                    None => div().text_color(cx.theme().muted_foreground).child("Ready"),
                 })
             })
             .child(div().flex_1())
@@ -838,6 +1033,75 @@ impl Skillshard {
                         Launcher::Npx { spec } => format!("using npx {spec}"),
                     }),
             )
+    }
+}
+
+/// The logo and the two-tone lowercase name.
+fn wordmark(cx: &App) -> impl IntoElement {
+    let (base, accent) = (cx.theme().foreground, cx.theme().primary);
+    h_flex()
+        .gap_2()
+        .items_center()
+        .child(
+            div()
+                .relative()
+                .size(px(20.))
+                .child(
+                    svg()
+                        .absolute()
+                        .size_full()
+                        .path(assets::LOGO_LEFT)
+                        .text_color(base),
+                )
+                .child(
+                    svg()
+                        .absolute()
+                        .size_full()
+                        .path(assets::LOGO_RIGHT)
+                        .text_color(accent),
+                ),
+        )
+        .child(
+            h_flex()
+                .text_base()
+                .font_semibold()
+                .child(div().text_color(base).child("skill"))
+                .child(div().text_color(accent).child("shard")),
+        )
+}
+
+/// A left-aligned, clickable sidebar row. `Button` centres its content, so
+/// sidebar entries are built from a plain row instead.
+fn nav_row(id: impl Into<SharedString>, cx: &App) -> Stateful<Div> {
+    h_flex()
+        .id(id.into())
+        .w_full()
+        .h_8()
+        .px_2()
+        .gap_2()
+        .items_center()
+        .text_sm()
+        .rounded(cx.theme().radius)
+        .hover(|this| this.bg(cx.theme().list_hover))
+}
+
+/// Small uppercase heading above a group of controls.
+fn section_label(text: &str, cx: &App) -> impl IntoElement {
+    div()
+        .px_1()
+        .pb_1()
+        .text_xs()
+        .font_medium()
+        .text_color(cx.theme().muted_foreground)
+        .child(text.to_uppercase())
+}
+
+/// `1 agent`, `3 agents`.
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
     }
 }
 
@@ -858,14 +1122,9 @@ fn meta_row(label: &str, value: String, cx: &App) -> impl IntoElement {
 
 impl Render for Skillshard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // The sidebar and detail pane are fixed width, so what is left over
-        // for the list is exact — no measurement pass needed.
-        let detail_width = if self.selected_skill().is_some() {
-            DETAIL_WIDTH
-        } else {
-            0.
-        };
-        let list_width = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH - detail_width;
+        // Both side panes are always on screen at a fixed width, so what is
+        // left over for the list is exact — no measurement pass needed.
+        let list_width = f32::from(window.viewport_size().width) - 2. * SIDE_PANE_WIDTH;
         let compact = list_width < COMPACT_LIST_WIDTH;
 
         v_flex()
@@ -883,6 +1142,8 @@ impl Render for Skillshard {
             )
             .child(self.render_status(cx))
             .children(self.install.clone())
+            .children(self.settings.clone())
+            .children(self.project_settings.clone())
     }
 }
 
@@ -891,9 +1152,8 @@ impl Render for Skillshard {
 impl Skillshard {
     /// Open the install dialog, pre-filled for the active scope.
     fn open_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let scope = self.scope().clone();
         let agents = self.in_use_agents();
-        let dialog = cx.new(|cx| super::install::InstallDialog::new(&scope, agents, window, cx));
+        let dialog = cx.new(|cx| super::install::InstallDialog::new(agents, window, cx));
 
         cx.subscribe(&dialog, |this, _, event, cx| match event {
             super::install::InstallEvent::Cancel => {
@@ -911,8 +1171,80 @@ impl Skillshard {
         cx.notify();
     }
 
+    fn open_settings(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let mut agents = self.in_use_agents();
+        let extra = scan::present_agents(&Scope::Global).into_iter().chain(
+            preferences::get(cx)
+                .install_agents
+                .iter()
+                .filter_map(|key| crate::agents::by_key(key)),
+        );
+        for agent in extra {
+            if !agents.iter().any(|a| a.key == agent.key) {
+                agents.push(agent);
+            }
+        }
+        agents.sort_by_key(|a| a.display);
+
+        let dialog = cx.new(|_| super::settings::SettingsDialog::new(agents));
+        cx.subscribe(&dialog, |this, _, event, cx| match event {
+            super::settings::SettingsEvent::Close => {
+                this.settings = None;
+                cx.notify();
+            }
+        })
+        .detach();
+        self.settings = Some(dialog);
+        cx.notify();
+    }
+
+    fn open_project_settings(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(Scope::Project(path)) = self.scopes.get(index).cloned() else {
+            return;
+        };
+        let dialog = cx.new(|cx| super::project_settings::ProjectSettingsDialog::new(path, cx));
+        cx.subscribe(&dialog, |this, _, event, cx| {
+            match event {
+                super::project_settings::ProjectSettingsEvent::Close => {}
+                super::project_settings::ProjectSettingsEvent::Remove(path) => {
+                    this.remove_project(path.clone(), cx)
+                }
+            }
+            this.project_settings = None;
+            cx.notify();
+        })
+        .detach();
+        self.project_settings = Some(dialog);
+        cx.notify();
+    }
+
+    /// Take a project out of the sidebar and preferences. Its files are left
+    /// exactly as they are.
+    fn remove_project(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        preferences::update(cx, |p| p.remove_project(&path));
+        let scope = Scope::Project(path);
+        let Some(index) = self.scopes.iter().position(|s| s == &scope) else {
+            return;
+        };
+        self.scopes.remove(index);
+        // Keep the same scope selected when an entry above it goes; fall back
+        // to the first one when the selected project itself was removed.
+        if self.active_scope == index {
+            self.active_scope = 0;
+            self.selected = None;
+        } else if self.active_scope > index {
+            self.active_scope -= 1;
+        }
+        self.log(format!("removed {} from the sidebar", scope.label()), false);
+        self.reload(cx);
+    }
+
     /// Run the install the dialog assembled.
-    fn start_install(&mut self, mut request: crate::skills_cli::InstallRequest, cx: &mut Context<Self>) {
+    fn start_install(
+        &mut self,
+        mut request: crate::skills_cli::InstallRequest,
+        cx: &mut Context<Self>,
+    ) {
         // The dialog chooses global vs project; the concrete project comes
         // from the window's active scope.
         if !request.scope.is_global() {
@@ -947,6 +1279,9 @@ impl Skillshard {
                 return;
             };
             this.update(cx, |this, cx| {
+                preferences::update(cx, |p| {
+                    p.project_mut(&root);
+                });
                 let scope = Scope::Project(root);
                 if let Some(index) = this.scopes.iter().position(|s| s == &scope) {
                     this.active_scope = index;
@@ -1046,9 +1381,7 @@ impl Skillshard {
                             other => return other,
                         }
                     }
-                    last.unwrap_or_else(|| {
-                        Err(std::io::Error::other("nothing to run"))
-                    })
+                    last.unwrap_or_else(|| Err(std::io::Error::other("nothing to run")))
                 })
                 .await;
 

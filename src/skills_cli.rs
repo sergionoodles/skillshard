@@ -7,6 +7,7 @@
 //! to ask in.
 
 use crate::model::Scope;
+use crate::paths;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::Command;
@@ -23,7 +24,7 @@ pub enum Launcher {
 impl Launcher {
     /// Prefer an installed binary, otherwise fall back to `npx`.
     pub fn detect() -> Self {
-        if which("skills").is_some() {
+        if paths::which("skills").is_some() {
             Launcher::Binary("skills".into())
         } else {
             Launcher::Npx {
@@ -39,14 +40,6 @@ impl Launcher {
             Launcher::Npx { spec } => ("npx".into(), vec!["--yes".into(), spec.clone()]),
         }
     }
-}
-
-/// Locate an executable on `PATH`.
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
 }
 
 /// Everything the user chooses in the install dialog before anything runs.

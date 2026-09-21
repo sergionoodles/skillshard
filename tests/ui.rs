@@ -8,6 +8,7 @@ use gpui_kit::component::Root;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{px, size, AppContext, TestAppContext};
 use skillshard::agents::by_key;
+use skillshard::editors::Editor;
 use skillshard::model::{Scope, UpdateState};
 use skillshard::tokens::estimate;
 use skillshard::ui::Skillshard;
@@ -1117,6 +1118,134 @@ fn the_sidebar_totals_the_skills_an_agent_actually_loads(cx: &mut TestAppContext
             window.find("always-total").label(),
             Some(format!("{expected} tokens always loaded").as_str())
         );
+    })
+    .unwrap();
+}
+
+/// An editor whose launcher records the folder it was asked to open, then
+/// exits with `code`.
+fn fake_editor(tag: &str, code: u8) -> (Editor, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir =
+        std::env::temp_dir().join(format!("skillshard-ui-editor-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let record = dir.join("opened");
+    let program = dir.join("fake-editor");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\nprintf %s \"$1\" > '{}'\nexit {code}\n",
+            record.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let editor = Editor {
+        name: "Fake Editor".into(),
+        program,
+    };
+    (editor, record)
+}
+
+fn open_with_editors(
+    scope: &Scope,
+    editors: Vec<Editor>,
+    cx: &mut TestAppContext,
+) -> gpui_kit::WindowHandle<Root> {
+    let scope = scope.clone();
+    cx.open_window(size(px(1180.), px(760.)), |window, cx| {
+        let view =
+            cx.new(|cx| Skillshard::with_scopes(vec![scope], window, cx).with_editors(editors));
+        Root::new(view, window, cx)
+    })
+}
+
+#[gpui_kit::test]
+fn the_edit_menu_opens_the_skill_folder_in_an_editor(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("edit-in", &["alpha"]);
+    let (editor, record) = fake_editor("ok", 0);
+    let handle = open_with_editors(&scope, vec![editor], cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-alpha", cx);
+        window.render_frame(cx);
+        window.within("edit-in").click("popup", cx);
+        window.render_frame(cx);
+        let mut menu = window.within("popup-menu");
+        assert_eq!(
+            menu.find(0usize).label(),
+            Some("Open folder in Fake Editor")
+        );
+        menu.click(0usize, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let dir = canonical(&scope, "alpha");
+    assert_eq!(
+        std::fs::read_to_string(&record).unwrap(),
+        dir.display().to_string()
+    );
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let status = window
+            .find("status-text")
+            .label()
+            .unwrap_or_default()
+            .to_string();
+        assert!(status.ends_with("in Fake Editor: done"), "{status}");
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn an_editor_that_fails_is_reported(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("edit-fail", &["alpha"]);
+    let (editor, _) = fake_editor("fail", 3);
+    let handle = open_with_editors(&scope, vec![editor], cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-alpha", cx);
+        window.render_frame(cx);
+        window.within("edit-in").click("popup", cx);
+        window.render_frame(cx);
+        window.within("popup-menu").click(0usize, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let status = window
+            .find("status-text")
+            .label()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            status.contains("in Fake Editor: exit status: 3"),
+            "{status}"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn without_editors_edit_is_a_plain_button(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("edit-plain", &["alpha"]);
+    let handle = open_with_editors(&scope, Vec::new(), cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-alpha", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("edit").is_some());
+        assert!(window.try_find("edit-in").is_none(), "no menu to offer");
     })
     .unwrap();
 }

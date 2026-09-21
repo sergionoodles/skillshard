@@ -1,5 +1,6 @@
 //! Home-relative path resolution, matching the `skills` CLI's own rules.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// The user's home directory.
@@ -55,4 +56,16 @@ pub fn shorten(path: &Path) -> String {
         Ok(rest) => format!("~/{}", rest.display()),
         Err(_) => path.display().to_string(),
     }
+}
+
+/// Locate an executable on `PATH`.
+pub fn which(name: &str) -> Option<PathBuf> {
+    which_in(name, &std::env::var_os("PATH")?)
+}
+
+/// Locate an executable in a `PATH`-style list of directories.
+pub fn which_in(name: &str, path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }

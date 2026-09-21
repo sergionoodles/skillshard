@@ -8,6 +8,7 @@
 
 pub mod agents;
 pub mod assets;
+pub mod editors;
 pub mod frontmatter;
 pub mod local_repos;
 pub mod lock;

@@ -1,11 +1,12 @@
 //! The main window: scopes on the left, skills in the middle, detail on the right.
 
 use crate::agents::Agent;
+use crate::editors::{self, Editor};
 use crate::model::{InstallKind, Scope, Skill, UpdateState};
 use crate::skills_cli::{self, Launcher};
 use crate::tokens::{self, TokenCost};
 use crate::{assets, ops, paths, preferences, registry, scan, themes, updates};
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonVariants, DropdownButton};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
@@ -59,6 +60,8 @@ pub struct Skillshard {
     installs_requested: HashSet<String>,
     /// Agents installed on this machine, detected once at startup.
     installed: Vec<&'static Agent>,
+    /// Editors a skill folder can be opened in, detected once at startup.
+    editors: Vec<Editor>,
     /// A folder a skill was just sent to, while asking whether it should join
     /// the sidebar as a project.
     offered_project: Option<PathBuf>,
@@ -123,6 +126,12 @@ impl Skillshard {
         self
     }
 
+    /// Replace the editors detected on this machine, for the same reason.
+    pub fn with_editors(mut self, editors: Vec<Editor>) -> Self {
+        self.editors = editors;
+        self
+    }
+
     /// Start on a specific set of scopes, followed by the projects saved in
     /// preferences. The UI tests use this to point the window at a fixture
     /// tree instead of the real home directory.
@@ -166,6 +175,7 @@ impl Skillshard {
             installs: HashMap::new(),
             installs_requested: HashSet::new(),
             installed: scan::installed_agents(),
+            editors: editors::detect(),
             offered_project: None,
             _subscriptions: subscriptions,
         };
@@ -431,6 +441,27 @@ impl Skillshard {
                     Err(e) => this.log(format!("{label}: {e}"), true),
                 }
                 this.reload(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Open a skill's folder in `editor`, reporting how it went.
+    fn open_in_editor(&mut self, editor: Editor, dir: PathBuf, cx: &mut Context<Self>) {
+        let label = format!("open {} in {}", paths::shorten(&dir), editor.name);
+        cx.spawn(async move |this, cx| {
+            let status = cx
+                .background_executor()
+                .spawn(async move { editor.open(&dir) })
+                .await;
+            this.update(cx, |this, cx| {
+                match status {
+                    Ok(status) if status.success() => this.log(format!("{label}: done"), false),
+                    Ok(status) => this.log(format!("{label}: {status}"), true),
+                    Err(e) => this.log(format!("{label}: {e}"), true),
+                }
                 cx.notify();
             })
             .ok();
@@ -951,14 +982,23 @@ impl Skillshard {
             .border_l_1()
             .border_color(cx.theme().border)
             .child(
-                div()
+                h_flex()
                     .w_full()
-                    .min_w_0()
                     .flex_shrink_0()
-                    .text_lg()
-                    .font_semibold()
-                    .truncate()
-                    .child(skill.display_name().to_string()),
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_lg()
+                            .font_semibold()
+                            .truncate()
+                            .child(skill.display_name().to_string()),
+                    )
+                    .when_some(skill.content_path(), |this, dir| {
+                        this.child(self.render_edit_button(dir, cx))
+                    }),
             )
             // The description wraps here rather than truncating: the detail
             // pane is where you actually read it. It is the only part that
@@ -1082,6 +1122,42 @@ impl Skillshard {
                         )),
                 )
             })
+    }
+
+    /// "Edit" opens `SKILL.md` with the system's handler for Markdown; the
+    /// caret lists the editors that can open the whole folder instead.
+    fn render_edit_button(&self, dir: &Path, cx: &mut Context<Self>) -> AnyElement {
+        let skill_md = dir.join("SKILL.md");
+        let edit = Button::new("edit")
+            .small()
+            .icon(Icon::empty().path("icons/square-pen.svg"))
+            .label("Edit")
+            .on_click(move |_, _, cx| cx.open_with_system(&skill_md));
+        if self.editors.is_empty() {
+            return edit.into_any_element();
+        }
+        let editors = self.editors.clone();
+        let view = cx.entity().downgrade();
+        let dir = dir.to_path_buf();
+        DropdownButton::new("edit-in")
+            .button(edit)
+            .dropdown_menu(move |mut menu, _, _| {
+                for editor in &editors {
+                    let (view, editor, dir) = (view.clone(), editor.clone(), dir.clone());
+                    menu = menu.item(
+                        PopupMenuItem::new(format!("Open folder in {}", editor.name)).on_click(
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.open_in_editor(editor.clone(), dir.clone(), cx)
+                                })
+                                .ok();
+                            },
+                        ),
+                    );
+                }
+                menu
+            })
+            .into_any_element()
     }
 
     /// "Move to" or "Copy to", opening a menu of every scope — global first,

@@ -9,6 +9,8 @@ other half: one window showing every skill across every agent, with the switches
 turn them on and off, keep agents in sync, and move or copy a skill between global and
 project scope.
 
+![Skillshard screenshot](docs/screenshot.png)
+
 ## What it does
 
 * **See everything at once** — every skill in a scope, which agents load it, where the

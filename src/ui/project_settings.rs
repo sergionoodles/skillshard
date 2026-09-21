@@ -13,29 +13,102 @@ use std::path::PathBuf;
 /// out because it stands for the global scope.
 pub const ICONS: &[&str] = &[
     "folder",
+    "folder-code",
+    "folder-git-2",
     "code",
+    "code-xml",
     "terminal",
+    "braces",
+    "git-branch",
+    "github",
+    "bug",
     "rocket",
     "package",
+    "box",
+    "boxes",
     "layers",
+    "blocks",
+    "puzzle",
+    "component",
     "server",
     "database",
     "cloud",
     "cpu",
+    "hard-drive",
+    "network",
+    "laptop",
+    "monitor",
+    "smartphone",
     "bot",
     "brain",
+    "brain-circuit",
     "sparkles",
+    "wand-sparkles",
     "zap",
+    "lightbulb",
+    "target",
+    "flask-conical",
+    "atom",
+    "dna",
+    "microscope",
+    "telescope",
+    "book-open",
+    "notebook-pen",
+    "graduation-cap",
+    "pen-tool",
+    "palette",
+    "brush",
+    "camera",
+    "image",
+    "film",
+    "music",
+    "headphones",
+    "gamepad-2",
+    "dice-5",
+    "trophy",
+    "crown",
+    "gem",
     "star",
     "heart",
+    "flame",
     "leaf",
-    "flask-conical",
-    "book-open",
+    "sprout",
+    "trees",
+    "flower-2",
+    "mountain",
+    "sun",
+    "moon",
+    "feather",
+    "compass",
+    "map",
+    "plane",
+    "car",
+    "bike",
+    "anchor",
     "briefcase",
-    "palette",
-    "gamepad-2",
+    "building-2",
+    "chart-line",
+    "wallet",
+    "shopping-cart",
+    "store",
     "house",
     "shield",
+    "lock",
+    "key",
+    "wrench",
+    "hammer",
+    "cog",
+    "calendar",
+    "mail",
+    "message-square",
+    "coffee",
+    "pizza",
+    "cat",
+    "dog",
+    "bird",
+    "fish",
+    "rabbit",
+    "ghost",
 ];
 
 /// Palette colours offered for projects, by GPUI Kit colour name.
@@ -112,7 +185,7 @@ impl Render for ProjectSettingsDialog {
                 let picked = icon_name.to_string();
                 div()
                     .id(SharedString::from(format!("icon-{icon_name}")))
-                    .size(px(32.))
+                    .size(px(36.))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -128,7 +201,7 @@ impl Render for ProjectSettingsDialog {
                     .child(
                         Icon::empty()
                             .path(format!("icons/{icon_name}.svg"))
-                            .small()
+                            .with_size(px(20.))
                             .text_color(tint),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -198,7 +271,7 @@ impl Render for ProjectSettingsDialog {
             .child(
                 v_flex()
                     .id("project-settings-dialog")
-                    .w(px(440.))
+                    .w(px(520.))
                     .p_5()
                     .gap_4()
                     .rounded(cx.theme().radius_lg)
@@ -235,7 +308,15 @@ impl Render for ProjectSettingsDialog {
                             ),
                     )
                     .child(field_label("Icon", cx))
-                    .child(h_flex().flex_wrap().gap_1().children(icon_tiles))
+                    .child(
+                        div()
+                            .id("icon-grid")
+                            // The full set is taller than a small window;
+                            // scroll it rather than push the buttons off.
+                            .max_h(px(280.))
+                            .overflow_y_scroll()
+                            .child(h_flex().flex_wrap().gap_1().children(icon_tiles)),
+                    )
                     .child(field_label("Colour", cx))
                     .child(h_flex().flex_wrap().gap_1().children(color_swatches))
                     .child(div().h_px().bg(cx.theme().border))

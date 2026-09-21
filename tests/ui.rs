@@ -747,7 +747,8 @@ fn open_with_agents(
 }
 
 /// Open `button`'s menu for a skill in one project, with a second project
-/// saved, and check it lists global, a divider, then both projects.
+/// saved, and check it lists global, a divider, both projects, then a
+/// divider and the folder picker.
 fn assert_scope_menu(button: &'static str, cx: &mut TestAppContext) {
     init(cx);
     let scope = fixture(&format!("{button}-from"), &["alpha"]);
@@ -771,6 +772,9 @@ fn assert_scope_menu(button: &'static str, cx: &mut TestAppContext) {
         assert!(menu.find(1usize).label().is_none());
         assert_eq!(menu.find(2usize).label(), Some(label(root).as_str()));
         assert_eq!(menu.find(3usize).label(), Some(label(&other).as_str()));
+        // Any folder comes last, after a second divider.
+        assert!(menu.find(4usize).label().is_none());
+        assert_eq!(menu.find(5usize).label(), Some("Folder…"));
     })
     .unwrap();
 }
@@ -783,6 +787,79 @@ fn move_to_offers_global_first_then_every_project(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn copy_to_offers_global_first_then_every_project(cx: &mut TestAppContext) {
     assert_scope_menu("copy-to", cx);
+}
+
+/// Open the window on one project and raise the "add as project?" modal
+/// for `folder`, as a finished transfer into it does.
+fn offer_folder(
+    scope: &Scope,
+    folder: &Path,
+    cx: &mut TestAppContext,
+) -> gpui_kit::WindowHandle<Root> {
+    let (handle, view) = open(scope, 1180., cx);
+    let folder = folder.to_path_buf();
+    cx.update(|cx| view.update(cx, |app, cx| app.offer_project(folder, cx)));
+    handle
+}
+
+#[gpui_kit::test]
+fn a_folder_a_skill_landed_in_can_be_added_as_a_project(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("offer-from", &["alpha"]);
+    let Scope::Project(folder) = fixture("offer-folder", &[]) else {
+        unreachable!()
+    };
+    let handle = offer_folder(&scope, &folder, cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("add-project-dialog").is_some());
+        window.click("add-project", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("add-project-dialog").is_none());
+        assert!(
+            window.try_find("scope-1").is_some(),
+            "listed in the sidebar"
+        );
+    })
+    .unwrap();
+    let saved = cx.update(|cx| skillshard::preferences::get(cx).project(&folder).is_some());
+    assert!(saved, "the project is remembered");
+}
+
+#[gpui_kit::test]
+fn declining_leaves_the_sidebar_alone(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("decline-from", &["alpha"]);
+    let Scope::Project(folder) = fixture("decline-folder", &[]) else {
+        unreachable!()
+    };
+    let handle = offer_folder(&scope, &folder, cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("dismiss-add-project", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("add-project-dialog").is_none());
+        assert!(window.try_find("scope-1").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_folder_already_in_the_sidebar_is_not_offered_again(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("offered-twice", &["alpha"]);
+    let Scope::Project(root) = &scope else {
+        unreachable!()
+    };
+    let handle = offer_folder(&scope, root, cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("add-project-dialog").is_none());
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]

@@ -19,12 +19,15 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 /// Width of both side panes: the scope sidebar and the detail pane.
 const SIDE_PANE_WIDTH: f32 = 300.;
 /// Below this, the list column loses the worded update badge and shows an
 /// arrow instead.
 const COMPACT_LIST_WIDTH: f32 = 460.;
+/// Icon size for sidebar entries, sized to sit beside `text_base` labels.
+const NAV_ICON_SIZE: f32 = 18.;
 
 /// A line in the activity log, recording what the app did.
 pub struct Activity {
@@ -38,6 +41,9 @@ pub struct Skillshard {
     scopes: Vec<Scope>,
     active_scope: usize,
     skills: Vec<Skill>,
+    /// Global skills, scanned alongside a project so the sidebar can total
+    /// what a session in that project actually carries. Empty otherwise.
+    global_skills: Vec<Skill>,
     selected: Option<String>,
     search: Entity<InputState>,
     activity: Vec<Activity>,
@@ -53,6 +59,9 @@ pub struct Skillshard {
     installs_requested: HashSet<String>,
     /// Agents installed on this machine, detected once at startup.
     installed: Vec<&'static Agent>,
+    /// A folder a skill was just sent to, while asking whether it should join
+    /// the sidebar as a project.
+    offered_project: Option<PathBuf>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -145,6 +154,7 @@ impl Skillshard {
             scopes,
             active_scope: 0,
             skills: Vec::new(),
+            global_skills: Vec::new(),
             selected: None,
             search,
             activity: Vec::new(),
@@ -156,6 +166,7 @@ impl Skillshard {
             installs: HashMap::new(),
             installs_requested: HashSet::new(),
             installed: scan::installed_agents(),
+            offered_project: None,
             _subscriptions: subscriptions,
         };
         this.report_preferences_error(cx);
@@ -232,6 +243,13 @@ impl Skillshard {
     fn reload(&mut self, cx: &mut Context<Self>) {
         let scope = self.scope().clone();
         self.skills = scan::scan(&scope);
+        // Only when global is one of the window's scopes: the UI tests leave
+        // it out so the real home directory never leaks into their totals.
+        self.global_skills = if !scope.is_global() && self.scopes.contains(&Scope::Global) {
+            scan::scan(&Scope::Global)
+        } else {
+            Vec::new()
+        };
         if let Some(name) = &self.selected {
             if !self.skills.iter().any(|s| &s.name == name) {
                 self.selected = None;
@@ -537,22 +555,14 @@ impl Skillshard {
             )
     }
 
-    /// What this scope's skills cost before anything is used: the front matter
-    /// of every skill at least one agent loads.
-    ///
-    /// Skills parked as disabled, and canonical copies no agent links to, are
-    /// not in any system prompt and so cost nothing.
-    fn always_tokens(&self) -> (u32, usize) {
-        let loaded = self.skills.iter().filter(|s| !s.installs.is_empty());
-        loaded.fold((0, 0), |(tokens, count), skill| {
-            (tokens + skill.cost.description, count + 1)
-        })
-    }
-
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let enabled = self.skills.iter().filter(|s| !s.disabled).count();
         let disabled = self.skills.len() - enabled;
-        let (always, loaded) = self.always_tokens();
+        let always = always_cost(&self.skills);
+        // Shown for a project whenever global is in the sidebar, even with no
+        // global skills: the total is then the project figure, which is true.
+        let combined = (!self.scope().is_global() && self.scopes.contains(&Scope::Global))
+            .then(|| combined_always_cost(&self.global_skills, &self.skills));
 
         let mut items: Vec<AnyElement> = Vec::new();
         for (index, scope) in self.scopes.iter().enumerate() {
@@ -581,7 +591,11 @@ impl Skillshard {
             .child(
                 nav_row("open-project", cx)
                     .text_color(cx.theme().muted_foreground)
-                    .child(Icon::empty().path("icons/folder-plus.svg").small())
+                    .child(
+                        Icon::empty()
+                            .path("icons/folder-plus.svg")
+                            .with_size(px(NAV_ICON_SIZE)),
+                    )
                     .child("Add project…")
                     .on_click(cx.listener(|this, _, window, cx| this.pick_project(window, cx)))
                     .test_support(),
@@ -597,37 +611,50 @@ impl Skillshard {
                         plural(self.shown_agents().len(), "agent")
                     ))
                     .child(
-                        h_flex()
-                            .id("always-total")
-                            .w_full()
-                            .gap_1()
-                            .items_center()
+                        always_row("always-total", always.tokens, "tokens always loaded", cx)
                             .aria_label(format!(
                                 "{} tokens always loaded",
-                                registry::format_count(always as u64)
+                                registry::format_count(always.tokens as u64)
                             ))
-                            .child(Icon::empty().path("icons/gauge.svg").xsmall())
-                            .child(
-                                div()
-                                    .text_color(budget_color(
-                                        always,
-                                        tokens::SCOPE_ALWAYS_BUDGET,
-                                        cx,
-                                    ))
-                                    .child(format!("≈ {}", registry::format_count(always as u64))),
-                            )
-                            .child("tokens always loaded")
                             .tooltip(move |window, cx| {
                                 Tooltip::new(format!(
                                     "The descriptions of the {} an agent loads here sit in the \
                                      system prompt of every session, whether or not they are \
                                      used. Estimated.",
-                                    plural(loaded, "skill"),
+                                    plural(always.skills, "skill"),
                                 ))
                                 .build(window, cx)
                             })
                             .test_support(),
                     )
+                    .when_some(combined, |this, combined| {
+                        this.child(
+                            always_row("always-combined", combined.tokens, "total with global", cx)
+                                .aria_label(format!(
+                                    "{} tokens always loaded with global",
+                                    registry::format_count(combined.tokens as u64)
+                                ))
+                                .tooltip(move |window, cx| {
+                                    let shadowed = if combined.shadowed == 0 {
+                                        String::new()
+                                    } else {
+                                        format!(
+                                            " {} named like a global skill {} counted once, as \
+                                             the global copy takes precedence.",
+                                            plural(combined.shadowed, "project skill"),
+                                            if combined.shadowed == 1 { "is" } else { "are" },
+                                        )
+                                    };
+                                    Tooltip::new(format!(
+                                        "What a session in this project carries: {} from this \
+                                         project and global combined.{shadowed} Estimated.",
+                                        plural(combined.skills, "skill"),
+                                    ))
+                                    .build(window, cx)
+                                })
+                                .test_support(),
+                        )
+                    })
                     .child(
                         div()
                             .truncate()
@@ -659,7 +686,7 @@ impl Skillshard {
         nav_row(SharedString::from(format!("scope-{index}")), cx)
             .when(active, |this| this.bg(cx.theme().list_active).font_medium())
             .child(
-                icon.small()
+                icon.with_size(px(NAV_ICON_SIZE))
                     .text_color(tint.unwrap_or(cx.theme().muted_foreground)),
             )
             .child(
@@ -674,7 +701,7 @@ impl Skillshard {
             .when(!scope.is_global(), |this| {
                 this.child(
                     Button::new(SharedString::from(format!("project-settings-{index}")))
-                        .xsmall()
+                        .small()
                         .ghost()
                         .icon(Icon::empty().path("icons/ellipsis.svg"))
                         .tooltip("Project settings")
@@ -1057,8 +1084,8 @@ impl Skillshard {
             })
     }
 
-    /// "Move to" or "Copy to", opening a menu of every scope: global first,
-    /// set apart from the projects as in the sidebar.
+    /// "Move to" or "Copy to", opening a menu of every scope — global first,
+    /// set apart from the projects as in the sidebar — and last, any folder.
     fn render_transfer_button(
         &self,
         transfer: Transfer,
@@ -1079,7 +1106,7 @@ impl Skillshard {
             .small()
             .label(label)
             .dropdown_caret(true)
-            .disabled(self.busy.is_some() || self.scopes.len() < 2)
+            .disabled(self.busy.is_some())
             .dropdown_menu(move |mut menu, _, _| {
                 for (index, scope) in &scopes {
                     let (view, name, to) = (view.clone(), name.clone(), scope.clone());
@@ -1097,7 +1124,12 @@ impl Skillshard {
                         menu = menu.separator();
                     }
                 }
-                menu
+                let (view, name) = (view.clone(), name.clone());
+                menu.separator()
+                    .item(PopupMenuItem::new("Folder…").on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| this.pick_folder(transfer, name.clone(), cx))
+                            .ok();
+                    }))
             })
     }
 
@@ -1271,17 +1303,82 @@ fn wordmark(cx: &App) -> impl IntoElement {
         )
 }
 
+/// What a set of skills costs before anything is used: the front matter of
+/// every skill at least one agent loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct AlwaysCost {
+    tokens: u32,
+    skills: usize,
+    /// Project skills left out because a global skill has the same name.
+    shadowed: usize,
+}
+
+/// Skills that are in some agent's system prompt. Skills parked as disabled,
+/// and canonical copies no agent links to, cost nothing.
+fn loaded(skills: &[Skill]) -> impl Iterator<Item = &Skill> {
+    skills.iter().filter(|s| !s.installs.is_empty())
+}
+
+/// The always-on cost of one scope's skills.
+fn always_cost(skills: &[Skill]) -> AlwaysCost {
+    combined_always_cost(&[], skills)
+}
+
+/// The always-on cost of a project session: the project's skills plus the
+/// global ones injected alongside them.
+///
+/// Agents know a skill by its front-matter name, so two copies under one name
+/// are one skill in the prompt and are counted once. On a clash the global
+/// copy is the one counted, following Claude Code's documented precedence
+/// (personal over project).
+fn combined_always_cost(global: &[Skill], project: &[Skill]) -> AlwaysCost {
+    let mut seen = HashSet::new();
+    let mut cost = AlwaysCost::default();
+    for skill in loaded(global) {
+        if seen.insert(skill.display_name()) {
+            cost.tokens += skill.cost.description;
+            cost.skills += 1;
+        }
+    }
+    let global_names = seen.clone();
+    for skill in loaded(project) {
+        if global_names.contains(skill.display_name()) {
+            cost.shadowed += 1;
+        } else if seen.insert(skill.display_name()) {
+            cost.tokens += skill.cost.description;
+            cost.skills += 1;
+        }
+    }
+    cost
+}
+
+/// A gauge icon, a budget-coloured token figure and a caption.
+fn always_row(id: &'static str, tokens: u32, caption: &'static str, cx: &App) -> Stateful<Div> {
+    h_flex()
+        .id(id)
+        .w_full()
+        .gap_1()
+        .items_center()
+        .child(Icon::empty().path("icons/gauge.svg").xsmall())
+        .child(
+            div()
+                .text_color(budget_color(tokens, tokens::SCOPE_ALWAYS_BUDGET, cx))
+                .child(format!("≈ {}", registry::format_count(tokens as u64))),
+        )
+        .child(caption)
+}
+
 /// A left-aligned, clickable sidebar row. `Button` centres its content, so
 /// sidebar entries are built from a plain row instead.
 fn nav_row(id: impl Into<SharedString>, cx: &App) -> Stateful<Div> {
     h_flex()
         .id(id.into())
         .w_full()
-        .h_8()
+        .h_9()
         .px_2()
         .gap_2()
         .items_center()
-        .text_sm()
+        .text_base()
         .rounded(cx.theme().radius)
         .hover(|this| this.bg(cx.theme().list_hover))
 }
@@ -1521,6 +1618,79 @@ fn link(
         .into_any_element()
 }
 
+impl Skillshard {
+    /// Asks whether a folder a skill was just sent to should become a project.
+    fn render_add_project(&self, path: &Path, cx: &mut Context<Self>) -> impl IntoElement {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| paths::shorten(path));
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(hsla(0., 0., 0., 0.45))
+            .child(
+                v_flex()
+                    .id("add-project-dialog")
+                    .w(px(420.))
+                    .p_5()
+                    .gap_4()
+                    .rounded(cx.theme().radius_lg)
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .font_semibold()
+                            .child(format!("Add {name} as a project?")),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "{} is not in the sidebar yet. As a project, its skills can be \
+                                 managed from here.",
+                                paths::shorten(path)
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("dismiss-add-project")
+                                    .small()
+                                    .ghost()
+                                    .label("Not now")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.offered_project = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("add-project")
+                                    .small()
+                                    .primary()
+                                    .label("Add project")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(path) = this.offered_project.take() {
+                                            this.add_project(path, cx);
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .test_support(),
+            )
+    }
+}
+
 impl Render for Skillshard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Both side panes are always on screen at a fixed width, so what is
@@ -1545,6 +1715,9 @@ impl Render for Skillshard {
             .children(self.install.clone())
             .children(self.settings.clone())
             .children(self.project_settings.clone())
+            .when_some(self.offered_project.clone(), |this, path| {
+                this.child(self.render_add_project(&path, cx))
+            })
     }
 }
 
@@ -1662,7 +1835,7 @@ impl Skillshard {
         }
         let label = format!("install {}", request.source);
         let cwd = skills_cli::working_dir(&request.scope);
-        self.run_steps(label, vec![(request.args(), cwd)], cx);
+        self.run_steps(label, vec![(request.args(), cwd)], |_, _| {}, cx);
     }
 
     /// Add a project directory to the scope list.
@@ -1682,22 +1855,82 @@ impl Skillshard {
                 return;
             };
             this.update(cx, |this, cx| {
-                preferences::update(cx, |p| {
-                    p.project_mut(&root);
-                });
-                let scope = Scope::Project(root);
-                if let Some(index) = this.scopes.iter().position(|s| s == &scope) {
-                    this.active_scope = index;
-                } else {
-                    this.scopes.push(scope);
-                    this.active_scope = this.scopes.len() - 1;
-                }
+                this.active_scope = this.add_project(root, cx);
                 this.selected = None;
                 this.reload(cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Put a project in the sidebar and preferences, returning its index.
+    /// A project already there is left where it is.
+    fn add_project(&mut self, root: PathBuf, cx: &mut Context<Self>) -> usize {
+        preferences::update(cx, |p| {
+            p.project_mut(&root);
+        });
+        let scope = Scope::Project(root);
+        match self.scopes.iter().position(|s| s == &scope) {
+            Some(index) => index,
+            None => {
+                self.scopes.push(scope);
+                self.scopes.len() - 1
+            }
+        }
+    }
+
+    /// Ask for any folder, not only a project, and send the skill there.
+    fn pick_folder(&mut self, transfer: Transfer, name: String, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(
+                match transfer {
+                    Transfer::Move => "Move here",
+                    Transfer::Copy => "Copy here",
+                }
+                .into(),
+            ),
+        });
+
+        cx.spawn(async move |this, cx| {
+            let chosen = match paths.await {
+                Ok(Ok(Some(chosen))) => chosen,
+                // Cancelled.
+                Ok(Ok(None)) | Err(_) => return,
+                Ok(Err(e)) => {
+                    this.update(cx, |this, cx| {
+                        this.log(format!("could not choose a folder: {e}"), true);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            let Some(root) = chosen.into_iter().next() else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.transfer_skill(transfer, name, Scope::Project(root), cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Ask whether `path` should join the sidebar as a project, unless it is
+    /// there already.
+    ///
+    /// Raised once a skill has landed in a folder. Public so the UI tests can
+    /// raise it without running the CLI.
+    pub fn offer_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.scopes.contains(&Scope::Project(path.clone())) {
+            return;
+        }
+        self.offered_project = Some(path);
+        cx.notify();
     }
 
     /// Install a skill into another scope, and for a move remove it here.
@@ -1761,15 +1994,22 @@ impl Skillshard {
         self.run_steps(
             format!("{} {name} to {}", transfer.verb(), to.label()),
             steps,
+            move |this, cx| {
+                if let Scope::Project(path) = to {
+                    this.offer_project(path, cx);
+                }
+            },
             cx,
         );
     }
 
-    /// Run CLI commands in order, stopping at the first failure.
+    /// Run CLI commands in order, stopping at the first failure, then call
+    /// `on_success` if every one succeeded.
     fn run_steps(
         &mut self,
         label: String,
         steps: Vec<(Vec<String>, std::path::PathBuf)>,
+        on_success: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) {
         if self.busy.is_some() {
@@ -1797,7 +2037,10 @@ impl Skillshard {
             this.update(cx, |this, cx| {
                 this.busy = None;
                 match outcome {
-                    Ok(outcome) if outcome.success => this.log(format!("{label}: done"), false),
+                    Ok(outcome) if outcome.success => {
+                        this.log(format!("{label}: done"), false);
+                        on_success(this, cx);
+                    }
                     Ok(outcome) => {
                         let detail = outcome
                             .stderr
@@ -1823,8 +2066,104 @@ impl Skillshard {
 mod tests {
     // Not `super::*`: the kit's glob export includes GPUI's `test` macro when
     // test support is on, which would shadow `#[test]`.
-    use super::split_shared_agents;
+    use super::{always_cost, combined_always_cost, split_shared_agents, AlwaysCost};
     use crate::agents::by_key;
+    use crate::model::{AgentInstall, InstallKind, Scope, Skill, UpdateState};
+    use crate::tokens::TokenCost;
+
+    /// A skill whose always-on cost is `tokens`, loaded by Claude Code unless
+    /// `loaded` is false.
+    fn skill(name: &str, tokens: u32, loaded: bool, scope: Scope) -> Skill {
+        let installs = if loaded {
+            vec![AgentInstall {
+                agent: by_key("claude-code").unwrap(),
+                path: name.into(),
+                kind: InstallKind::Copy,
+            }]
+        } else {
+            Vec::new()
+        };
+        Skill {
+            name: name.into(),
+            title: None,
+            description: String::new(),
+            scope,
+            canonical: None,
+            installs,
+            lock: None,
+            disabled: false,
+            update: UpdateState::Unknown,
+            cost: TokenCost {
+                description: tokens,
+                ..TokenCost::default()
+            },
+        }
+    }
+
+    fn global(name: &str, tokens: u32) -> Skill {
+        skill(name, tokens, true, Scope::Global)
+    }
+
+    fn project(name: &str, tokens: u32) -> Skill {
+        skill(name, tokens, true, Scope::Project("/p".into()))
+    }
+
+    #[test]
+    fn the_total_adds_global_skills_to_the_project_s() {
+        let cost = combined_always_cost(&[global("a", 10)], &[project("b", 20)]);
+        assert_eq!(
+            cost,
+            AlwaysCost {
+                tokens: 30,
+                skills: 2,
+                shadowed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_name_in_both_scopes_is_counted_once_at_the_global_cost() {
+        let cost = combined_always_cost(
+            &[global("shared", 10), global("a", 5)],
+            &[project("shared", 99), project("b", 20)],
+        );
+        assert_eq!(
+            cost,
+            AlwaysCost {
+                tokens: 35,
+                skills: 3,
+                shadowed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn the_front_matter_name_decides_a_clash_not_the_directory() {
+        let mut renamed = project("dir-name", 99);
+        renamed.title = Some("shared".into());
+        let cost = combined_always_cost(&[global("shared", 10)], &[renamed]);
+        assert_eq!((cost.tokens, cost.shadowed), (10, 1));
+    }
+
+    #[test]
+    fn a_global_skill_no_agent_loads_neither_counts_nor_shadows() {
+        let unloaded = skill("shared", 10, false, Scope::Global);
+        let cost = combined_always_cost(&[unloaded], &[project("shared", 20)]);
+        assert_eq!(
+            cost,
+            AlwaysCost {
+                tokens: 20,
+                skills: 1,
+                shadowed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn one_scope_alone_counts_only_what_an_agent_loads() {
+        let unloaded = skill("off", 50, false, Scope::Global);
+        assert_eq!(always_cost(&[global("on", 7), unloaded]).tokens, 7);
+    }
 
     fn split(keys: &[&str]) -> (Vec<&'static str>, Vec<&'static str>) {
         let agents: Vec<_> = keys.iter().map(|k| by_key(k).unwrap()).collect();

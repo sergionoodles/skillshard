@@ -18,8 +18,9 @@ project scope.
 * **Per-agent control** — tick an agent to link the skill into it, untick to unlink.
   The canonical copy is never touched. Only agents installed on this machine are
   listed, detected by their own config directory (`~/.claude`, `~/.codex`, …).
-* **Move or copy between scopes** — to global or any project, done by reinstalling
-  through the CLI so both lock files stay correct and update tracking survives.
+* **Move or copy between scopes** — to global, any project or any folder, done by
+  reinstalling through the CLI so both lock files stay correct and update tracking
+  survives.
 * **Update status** — a read-only check against each skill's upstream, so you can see
   what is stale before changing anything. Updating itself is delegated to the CLI.
 * **Install with a security review** — every option (source, skills, agents, scope,

@@ -36,10 +36,7 @@ impl Launcher {
     fn program(&self) -> (String, Vec<String>) {
         match self {
             Launcher::Binary(bin) => (bin.clone(), Vec::new()),
-            Launcher::Npx { spec } => (
-                "npx".into(),
-                vec!["--yes".into(), spec.clone()],
-            ),
+            Launcher::Npx { spec } => ("npx".into(), vec!["--yes".into(), spec.clone()]),
         }
     }
 }
@@ -163,7 +160,11 @@ impl Outcome {
 /// Run a `skills` subcommand to completion.
 ///
 /// Blocking: call it from a background executor, not the UI thread.
-pub fn run(launcher: &Launcher, args: &[String], cwd: &std::path::Path) -> std::io::Result<Outcome> {
+pub fn run(
+    launcher: &Launcher,
+    args: &[String],
+    cwd: &std::path::Path,
+) -> std::io::Result<Outcome> {
     let (program, prefix) = launcher.program();
     let full: Vec<String> = prefix.iter().chain(args.iter()).cloned().collect();
 

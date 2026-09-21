@@ -224,9 +224,11 @@ fn default_agents(
     preferred: &[String],
 ) -> Vec<(&'static Agent, bool)> {
     let mut offered = in_use;
+    offered.retain(|a| a.in_cli());
     for agent in preferred
         .iter()
         .filter_map(|key| crate::agents::by_key(key))
+        .filter(|a| a.in_cli())
     {
         if !offered.iter().any(|a| a.key == agent.key) {
             offered.push(agent);
@@ -693,6 +695,16 @@ mod tests {
         assert_eq!(
             keys(&default_agents(in_use, &preferred)),
             [("claude-code", false), ("codex", true), ("windsurf", true)]
+        );
+    }
+
+    #[test]
+    fn agents_the_cli_cannot_install_to_are_not_offered() {
+        let in_use = vec![by_key("claude-code").unwrap(), by_key("omp").unwrap()];
+        let preferred = ["omp".to_string()];
+        assert_eq!(
+            keys(&default_agents(in_use, &preferred)),
+            [("claude-code", false)]
         );
     }
 

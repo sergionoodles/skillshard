@@ -7,7 +7,9 @@
 use gpui_kit::component::Root;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{px, size, AppContext, TestAppContext};
+use skillshard::agents::by_key;
 use skillshard::model::{Scope, UpdateState};
+use skillshard::tokens::estimate;
 use skillshard::ui::Skillshard;
 use std::path::{Path, PathBuf};
 
@@ -190,6 +192,67 @@ fn unchecking_an_agent_removes_only_that_agents_link(cx: &mut TestAppContext) {
         // The skill itself is still installed.
         assert!(canonical(&scope, "alpha").is_dir());
         assert_eq!(window.find("agent-claude-code").checked(), Some(false));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn agents_reading_the_canonical_dir_show_a_locked_checkbox(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("shared", &["alpha"]);
+    link(&scope, ".claude/skills", "alpha");
+    let handle = open_with_agents(
+        vec![scope.clone()],
+        &["claude-code", "codex", "cursor", "opencode", "pi"],
+        cx,
+    );
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-alpha", cx);
+        window.render_frame(cx);
+
+        assert_eq!(window.find("agent-shared").checked(), Some(true));
+        // Many agents read .agents/skills; beyond the first few they collapse.
+        assert!(window.try_find("agent-shared-more").is_some());
+        // It leads the list, ahead of the agents that can be toggled.
+        assert!(
+            window.find("agent-shared").bounds().origin.y
+                < window.find("agent-claude-code").bounds().origin.y
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_copy_in_a_shared_readers_own_directory_is_listed_for_that_agent(cx: &mut TestAppContext) {
+    init(cx);
+    // Pi reads .agents/skills too, but this skill lives only in .pi/skills.
+    let scope = fixture("own-copy", &[]);
+    let Scope::Project(root) = scope.clone() else {
+        unreachable!()
+    };
+    let dir = root.join(".pi/skills/solo");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: solo\ndescription: d\n---\n",
+    )
+    .unwrap();
+
+    let handle = cx.open_window(size(px(1180.), px(760.)), |window, cx| {
+        let view = cx.new(|cx| Skillshard::with_scopes(vec![scope.clone()], window, cx));
+        Root::new(view, window, cx)
+    });
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-solo", cx);
+        window.render_frame(cx);
+
+        assert_eq!(window.find("agent-pi").checked(), Some(true));
+        // Nothing is in .agents/skills, so no agent sees it through there.
+        assert!(window.try_find("agent-shared").is_none());
     })
     .unwrap();
 }
@@ -391,6 +454,94 @@ fn long_names_and_descriptions_stay_inside_the_row(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_long_description_scrolls_on_its_own_and_the_controls_stay_on_screen(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("long-detail", &[]);
+    let dir = scope.canonical_dir().join("alpha");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!(
+            "---\nname: alpha\ndescription: {}\n---\n",
+            "A very long description ".repeat(200)
+        ),
+    )
+    .unwrap();
+    link(&scope, ".claude/skills", "alpha");
+
+    // The detail pane's fixed lower half — metadata, context cost, actions,
+    // agents — needs this much before the description starts giving up height.
+    let height = 620.;
+    let handle = cx.open_window(size(px(1180.), px(height)), |window, cx| {
+        let view = cx.new(|cx| Skillshard::with_scopes(vec![scope.clone()], window, cx));
+        Root::new(view, window, cx)
+    });
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-alpha", cx);
+        window.render_frame(cx);
+
+        let description = window.find("detail-description").bounds();
+        let uninstall = window.find("remove").bounds();
+        let agent = window.find("agent-claude-code").bounds();
+        assert!(
+            uninstall.top() >= description.bottom(),
+            "buttons sit below the description"
+        );
+        assert!(
+            agent.bottom() <= px(height),
+            "agent checkboxes stay inside the window"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_skill_from_a_remote_repo_links_to_it(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("repo-link", &["alpha"]);
+    let Scope::Project(root) = scope.clone() else {
+        unreachable!()
+    };
+    std::fs::write(
+        root.join("skills-lock.json"),
+        r#"{"skills":{"alpha":{"source":"owner/repo","sourceType":"github","sourceUrl":"https://github.com/owner/repo.git"}}}"#,
+    )
+    .unwrap();
+    let (handle, _view) = open(&scope, 1180., cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-alpha", cx);
+        window.render_frame(cx);
+        window.click("source-link", cx);
+    })
+    .unwrap();
+
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://github.com/owner/repo")
+    );
+}
+
+#[gpui_kit::test]
+fn a_local_skill_has_no_repo_link(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("no-repo-link", &["alpha"]);
+    let (handle, _view) = open(&scope, 1180., cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-alpha", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("source-link").is_none());
+        assert!(window.try_find("location-link").is_some());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn the_badge_collapses_when_the_list_is_narrow_even_with_nothing_selected(cx: &mut TestAppContext) {
     // Regression: the detail pane is always on screen, but the width check
     // only counted it once a skill was selected, overestimating the list.
@@ -580,6 +731,148 @@ fn saved_projects_are_restored_in_the_sidebar(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+/// Open the window on `scopes`, with `installed` standing in for the agents
+/// detected on this machine.
+fn open_with_agents(
+    scopes: Vec<Scope>,
+    installed: &[&str],
+    cx: &mut TestAppContext,
+) -> gpui_kit::WindowHandle<Root> {
+    let installed: Vec<_> = installed.iter().map(|k| by_key(k).unwrap()).collect();
+    cx.open_window(size(px(1180.), px(760.)), |window, cx| {
+        let view = cx
+            .new(|cx| Skillshard::with_scopes(scopes, window, cx).with_installed_agents(installed));
+        Root::new(view, window, cx)
+    })
+}
+
+/// Open `button`'s menu for a skill in one project, with a second project
+/// saved, and check it lists global, a divider, then both projects.
+fn assert_scope_menu(button: &'static str, cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture(&format!("{button}-from"), &["alpha"]);
+    let other = saved_project(&format!("{button}-to"), "beta", cx);
+    let handle = open_with_agents(vec![scope.clone(), Scope::Global], &[], cx);
+    let label = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
+    let Scope::Project(root) = &scope else {
+        unreachable!()
+    };
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-alpha", cx);
+        window.render_frame(cx);
+        window.click(button, cx);
+        window.render_frame(cx);
+
+        let menu = window.within("popup-menu");
+        assert_eq!(menu.find(0usize).label(), Some("Global"));
+        // Global is set apart by a divider, so the projects start after it.
+        assert!(menu.find(1usize).label().is_none());
+        assert_eq!(menu.find(2usize).label(), Some(label(root).as_str()));
+        assert_eq!(menu.find(3usize).label(), Some(label(&other).as_str()));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn move_to_offers_global_first_then_every_project(cx: &mut TestAppContext) {
+    assert_scope_menu("move-to", cx);
+}
+
+#[gpui_kit::test]
+fn copy_to_offers_global_first_then_every_project(cx: &mut TestAppContext) {
+    assert_scope_menu("copy-to", cx);
+}
+
+#[gpui_kit::test]
+fn sync_is_gone_and_uninstall_is_called_remove(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("actions", &["alpha"]);
+    let handle = open_with_agents(vec![scope.clone()], &[], cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-alpha", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("sync").is_none());
+        assert_eq!(window.find("remove").label(), Some("Remove"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn copying_to_a_project_goes_through_the_menu_item(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("copy-from", &["alpha"]);
+    let other = saved_project("copy-to", "beta", cx);
+    let handle = open_with_agents(vec![scope.clone(), Scope::Global], &[], cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-alpha", cx);
+        window.render_frame(cx);
+        window.click("copy-to", cx);
+        window.render_frame(cx);
+        window.within("popup-menu").click(3usize, cx);
+        window.render_frame(cx);
+
+        // The fixture has no lock file, so the copy stops before running the
+        // CLI — with a message naming the action that was picked.
+        assert_eq!(
+            window.find("status-text").label(),
+            Some("alpha has no recorded source to copy it from")
+        );
+        assert!(canonical(&scope, "alpha").is_dir());
+        assert!(!other.join(".agents/skills/alpha").exists());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn only_installed_agents_are_listed(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("installed", &["alpha"]);
+    let Scope::Project(root) = &scope else {
+        unreachable!()
+    };
+    // `skills/` is OpenClaw's project directory, but a project having one
+    // does not mean OpenClaw is installed.
+    std::fs::create_dir_all(root.join("skills")).unwrap();
+    let handle = open_with_agents(vec![scope.clone()], &["claude-code", "codex"], cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-alpha", cx);
+        window.render_frame(cx);
+
+        assert_eq!(window.find("agent-claude-code").checked(), Some(false));
+        assert!(window.try_find("agent-openclaw").is_none());
+        // Codex is the only installed agent reading .agents/skills, so the
+        // shared row does not pad itself out with the rest.
+        assert!(window.try_find("agent-shared").is_some());
+        assert!(window.try_find("agent-shared-more").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn an_agent_holding_a_skill_is_listed_even_when_not_detected(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("undetected", &["alpha"]);
+    link(&scope, ".windsurf/skills", "alpha");
+    let handle = open_with_agents(vec![scope.clone()], &[], cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-alpha", cx);
+        window.render_frame(cx);
+        // Its link is on disk, so there is something to untick.
+        assert_eq!(window.find("agent-windsurf").checked(), Some(true));
+    })
+    .unwrap();
+}
+
 #[gpui_kit::test]
 fn project_settings_save_the_icon_and_colour(cx: &mut TestAppContext) {
     init(cx);
@@ -647,4 +940,106 @@ fn removing_the_open_project_falls_back_and_keeps_its_files(cx: &mut TestAppCont
         root.join(".agents/skills/beta/SKILL.md").is_file(),
         "removing a project never deletes its files"
     );
+}
+
+#[gpui_kit::test]
+fn the_detail_pane_breaks_a_skill_s_context_cost_into_three_figures(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("cost", &[]);
+    let dir = scope.canonical_dir().join("alpha");
+    std::fs::create_dir_all(dir.join("references")).unwrap();
+    // Sized so each figure lands in a different bucket, and so the bundled
+    // file dwarfs the body it sits next to.
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!(
+            "---\nname: alpha\ndescription: {}\n---\n\n{}",
+            "word ".repeat(20),
+            "body ".repeat(100)
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("references/extra.md"), "detail ".repeat(1000)).unwrap();
+    link(&scope, ".claude/skills", "alpha");
+
+    let handle = cx.open_window(size(px(1180.), px(760.)), |window, cx| {
+        let view = cx.new(|cx| Skillshard::with_scopes(vec![scope.clone()], window, cx));
+        Root::new(view, window, cx)
+    });
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-alpha", cx);
+        window.render_frame(cx);
+
+        // Name plus description, body, and references, at roughly 3.7
+        // characters per token.
+        assert_eq!(
+            window.find("cost-always").label(),
+            Some("Always ≈ 29 tokens")
+        );
+        assert_eq!(
+            window.find("cost-trigger").label(),
+            Some("Trigger ≈ 136 tokens")
+        );
+        assert_eq!(
+            window.find("cost-bundled").label(),
+            Some("Bundled ≈ 1.8k tokens")
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn each_list_row_carries_the_compact_cost_figures(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("row-cost", &["alpha"]);
+    link(&scope, ".claude/skills", "alpha");
+
+    let handle = cx.open_window(size(px(1180.), px(760.)), |window, cx| {
+        let view = cx.new(|cx| Skillshard::with_scopes(vec![scope.clone()], window, cx));
+        Root::new(view, window, cx)
+    });
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let always = estimate("alpha") + estimate("Description of alpha");
+        // The fixture skill has no body and no bundled files, so only the
+        // first figure has anything to report.
+        assert_eq!(
+            window.find("cost-alpha").label(),
+            Some(format!("{always} always, — on trigger, — bundled").as_str())
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_sidebar_totals_the_skills_an_agent_actually_loads(cx: &mut TestAppContext) {
+    init(cx);
+    // `linked` and `canonical` both reach an agent — the second through the
+    // agents that read `.agents/skills` directly. `parked` is disabled, so it
+    // is in no system prompt and must not be counted.
+    let scope = fixture("always-total", &["linked", "canonical", "parked"]);
+    link(&scope, ".claude/skills", "linked");
+    std::fs::create_dir_all(scope.disabled_dir()).unwrap();
+    std::fs::rename(canonical(&scope, "parked"), disabled(&scope, "parked")).unwrap();
+
+    let handle = cx.open_window(size(px(1180.), px(760.)), |window, cx| {
+        let view = cx.new(|cx| Skillshard::with_scopes(vec![scope.clone()], window, cx));
+        Root::new(view, window, cx)
+    });
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let expected = estimate("linked")
+            + estimate("Description of linked")
+            + estimate("canonical")
+            + estimate("Description of canonical");
+        assert_eq!(
+            window.find("always-total").label(),
+            Some(format!("{expected} tokens always loaded").as_str())
+        );
+    })
+    .unwrap();
 }

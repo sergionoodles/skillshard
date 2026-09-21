@@ -16,7 +16,7 @@ pub struct FrontMatter {
 /// Returns an empty result when the file has no front matter.
 pub fn parse(source: &str) -> FrontMatter {
     let mut out = FrontMatter::default();
-    let Some(block) = fenced_block(source) else {
+    let Some((block, _)) = fenced_block(source) else {
         return out;
     };
 
@@ -56,8 +56,20 @@ pub fn parse(source: &str) -> FrontMatter {
     out
 }
 
-/// Extract the text between the opening and closing `---` fences.
-fn fenced_block(source: &str) -> Option<&str> {
+/// The instructions below the front matter — what an agent reads once the
+/// skill triggers.
+///
+/// A file without front matter is all body.
+pub fn body(source: &str) -> &str {
+    match fenced_block(source) {
+        Some((_, rest)) => rest.trim_start_matches(['\n', '\r']),
+        None => source,
+    }
+}
+
+/// Extract the text between the opening and closing `---` fences, and
+/// whatever follows the closing fence.
+fn fenced_block(source: &str) -> Option<(&str, &str)> {
     let body = source
         .strip_prefix("---\n")
         .or_else(|| source.strip_prefix("---\r\n"))?;
@@ -68,7 +80,7 @@ fn fenced_block(source: &str) -> Option<&str> {
             after.is_empty() || after.starts_with('\n') || after.starts_with('\r')
         })
         .map(|(idx, _)| idx)?;
-    Some(&body[..end])
+    Some((&body[..end], &body[end + 4..]))
 }
 
 /// Collect an indented block scalar, joining lines when `fold` is set.
@@ -160,5 +172,23 @@ mod tests {
     #[test]
     fn missing_front_matter_is_empty() {
         assert_eq!(parse("# Just a heading\n"), FrontMatter::default());
+    }
+
+    #[test]
+    fn the_body_starts_after_the_closing_fence() {
+        assert_eq!(body("---\nname: a\n---\n\n# Body\n"), "# Body\n");
+    }
+
+    #[test]
+    fn a_body_containing_a_rule_is_not_truncated() {
+        assert_eq!(
+            body("---\nname: a\n---\n\nOne\n\n---\n\nTwo\n"),
+            "One\n\n---\n\nTwo\n"
+        );
+    }
+
+    #[test]
+    fn a_file_without_front_matter_is_all_body() {
+        assert_eq!(body("# Just a heading\n"), "# Just a heading\n");
     }
 }

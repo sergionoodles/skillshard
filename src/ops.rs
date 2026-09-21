@@ -32,8 +32,8 @@ impl std::fmt::Display for OpError {
             }
             OpError::SharesCanonicalDir(agent) => write!(
                 f,
-                "{agent} reads the shared .agents/skills directory, so it \
-                 cannot be toggled on its own"
+                "{agent} loads it from a directory shared with other agents, \
+                 so it cannot be toggled on its own"
             ),
             OpError::Occupied(path) => {
                 write!(f, "{} already exists", path.display())
@@ -113,7 +113,7 @@ pub fn link_agent(skill: &Skill, agent: &'static Agent) -> Result<()> {
     let Some(agent_dir) = skill.scope.agent_dir(agent) else {
         return Err(OpError::SharesCanonicalDir(agent.display));
     };
-    if agent_dir == skill.scope.canonical_dir() {
+    if skill.scope.reads_canonical(agent) {
         // Already visible to this agent by virtue of the shared directory.
         return Ok(());
     }
@@ -223,38 +223,12 @@ pub fn enable(skill: &Skill) -> Result<()> {
 
 /// Whether `agent` can be toggled independently in `scope`.
 ///
-/// Agents that read the shared `.agents/skills` directory see a skill purely
+/// Agents that read the shared `.agents/skills` directory — as their own or as
+/// an extra directory — see a skill purely
 /// because it exists there, so they have no link of their own to add or
 /// remove. They follow the skill's enabled state instead.
 pub fn is_togglable(scope: &Scope, agent: &Agent) -> bool {
-    scope
-        .agent_dir(agent)
-        .is_some_and(|dir| dir != scope.canonical_dir())
-}
-
-/// Give every agent in `targets` the skill, and remove it from the rest.
-///
-/// This is the "sync across agents" action: one call brings a skill's agent
-/// coverage to exactly the requested set. Agents sharing the canonical
-/// directory are left alone — see [`is_togglable`].
-pub fn sync_agents(skill: &Skill, targets: &[&'static Agent]) -> Vec<(String, OpError)> {
-    let mut errors = Vec::new();
-    for agent in targets {
-        if !skill.is_enabled_for(agent) {
-            if let Err(e) = link_agent(skill, agent) {
-                errors.push((agent.display.to_string(), e));
-            }
-        }
-    }
-    for install in &skill.installs {
-        let wanted = targets.iter().any(|a| a.key == install.agent.key);
-        if !wanted && install.kind.is_unlinkable() {
-            if let Err(e) = unlink_agent(skill, install.agent) {
-                errors.push((install.agent.display.to_string(), e));
-            }
-        }
-    }
-    errors
+    scope.agent_dir(agent).is_some() && !scope.reads_canonical(agent)
 }
 
 /// Move a directory, falling back to copy-then-delete across filesystems.
@@ -339,7 +313,10 @@ mod tests {
         assert!(skill.is_enabled_for(claude));
         // The CLI's own convention: a relative symlink, not a copy.
         let link = scope.agent_dir(claude).unwrap().join("alpha");
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
 
         unlink_agent(&get(&scope, "alpha"), claude).unwrap();
         assert!(!get(&scope, "alpha").is_enabled_for(claude));
@@ -355,6 +332,30 @@ mod tests {
         let err = unlink_agent(&get(&scope, "beta"), cursor).unwrap_err();
         assert!(matches!(err, OpError::SharesCanonicalDir(_)));
         assert!(scope.canonical_dir().join("beta").is_dir());
+    }
+
+    #[test]
+    fn agents_reading_the_canonical_dir_through_an_extra_directory_are_not_togglable() {
+        assert!(!is_togglable(&Scope::Global, by_key("codex").unwrap()));
+        assert!(!is_togglable(&Scope::Global, by_key("pi").unwrap()));
+        assert!(is_togglable(&Scope::Global, by_key("claude-code").unwrap()));
+    }
+
+    #[test]
+    fn unlinking_an_inherited_install_leaves_the_owner_alone() {
+        let scope = fixture("inherited");
+        let claude = by_key("claude-code").unwrap();
+        let claude_dir = scope.agent_dir(claude).unwrap();
+        std::fs::create_dir_all(claude_dir.join("zeta")).unwrap();
+        std::fs::write(
+            claude_dir.join("zeta/SKILL.md"),
+            "---\nname: zeta\ndescription: d\n---\n",
+        )
+        .unwrap();
+
+        let err = unlink_agent(&get(&scope, "zeta"), by_key("opencode").unwrap()).unwrap_err();
+        assert!(matches!(err, OpError::SharesCanonicalDir(_)));
+        assert!(claude_dir.join("zeta/SKILL.md").is_file());
     }
 
     #[test]
@@ -391,32 +392,16 @@ mod tests {
         assert!(off.disabled);
         assert!(off.installs.is_empty());
         assert!(!scope.canonical_dir().join("gamma").exists());
-        assert!(scope.disabled_dir().join("gamma").join("SKILL.md").is_file());
+        assert!(scope
+            .disabled_dir()
+            .join("gamma")
+            .join("SKILL.md")
+            .is_file());
 
         enable(&get(&scope, "gamma")).unwrap();
         let on = get(&scope, "gamma");
         assert!(!on.disabled);
         assert!(on.is_enabled_for(claude), "previous agents are restored");
         assert!(scope.canonical_dir().join("gamma").is_dir());
-    }
-
-    #[test]
-    fn sync_brings_agent_coverage_to_exactly_the_requested_set() {
-        let scope = fixture("sync");
-        write_skill(&scope, "delta");
-        let claude = by_key("claude-code").unwrap();
-        let windsurf = by_key("windsurf").unwrap();
-        link_agent(&get(&scope, "delta"), claude).unwrap();
-
-        let errors = sync_agents(&get(&scope, "delta"), &[windsurf]);
-        assert!(errors.is_empty(), "{errors:?}");
-        let skill = get(&scope, "delta");
-        assert!(skill.is_enabled_for(windsurf));
-        assert!(!skill.is_enabled_for(claude));
-        // Agents that read .agents/skills directly are not touched by sync:
-        // they follow the skill's enabled state instead.
-        let cursor = by_key("cursor").unwrap();
-        assert!(!is_togglable(&scope, cursor));
-        assert!(skill.is_enabled_for(cursor));
     }
 }

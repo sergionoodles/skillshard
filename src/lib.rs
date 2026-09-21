@@ -20,5 +20,6 @@ pub mod scan;
 pub mod skills_cli;
 pub mod state;
 pub mod themes;
+pub mod tokens;
 pub mod ui;
 pub mod updates;

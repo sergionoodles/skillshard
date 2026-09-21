@@ -6,8 +6,8 @@
 //!     cargo test --test live_install -- --ignored --nocapture
 
 use skillshard::model::Scope;
-use skillshard::skills_cli::{self, InstallRequest, Launcher};
 use skillshard::scan;
+use skillshard::skills_cli::{self, InstallRequest, Launcher};
 
 #[test]
 #[ignore = "requires network and npx"]

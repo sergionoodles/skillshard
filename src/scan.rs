@@ -8,6 +8,7 @@ use crate::agents::{Agent, AGENTS};
 use crate::frontmatter;
 use crate::lock;
 use crate::model::{AgentInstall, InstallKind, LockEntry, Scope, Skill, UpdateState};
+use crate::tokens::{self, TokenCost};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -83,15 +84,21 @@ pub fn agent_dirs(scope: &Scope) -> Vec<(&'static Agent, PathBuf)> {
         .collect()
 }
 
-/// Agents whose skills directory currently exists on disk.
+/// Agents installed on this machine: those whose own directory, the one
+/// holding their global skills directory, exists (see [`Agent::has_own_home`]).
 ///
-/// Used to keep the UI focused on agents the user actually has, rather than
-/// all 79 the CLI supports.
-pub fn present_agents(scope: &Scope) -> Vec<&'static Agent> {
-    agent_dirs(scope)
-        .into_iter()
-        .filter(|(_, dir)| dir.is_dir() || dir.parent().is_some_and(Path::is_dir))
-        .map(|(agent, _)| agent)
+/// The same set applies to every scope. A project's directory layout says
+/// nothing about which agents the user has: `skills/` is OpenClaw's project
+/// directory, and `.agents/skills` is read by dozens of agents.
+pub fn installed_agents() -> Vec<&'static Agent> {
+    AGENTS
+        .iter()
+        .filter(|agent| {
+            agent.has_own_home()
+                && Scope::Global
+                    .agent_dir(agent)
+                    .is_some_and(|dir| dir.parent().is_some_and(Path::is_dir))
+        })
         .collect()
 }
 
@@ -112,6 +119,7 @@ fn entry_for<'a>(
         lock: locks.get(name).cloned(),
         disabled: false,
         update: UpdateState::Unknown,
+        cost: TokenCost::default(),
     })
 }
 
@@ -142,21 +150,31 @@ pub fn scan(scope: &Scope) -> Vec<Skill> {
         skill.description = fm.description.unwrap_or_default();
     }
 
-    // 3. Everything each agent actually loads.
-    for (agent, dir) in agent_dirs(scope) {
-        for found in read_skill_dirs(&dir) {
-            let kind = classify(&found.path, &canonical_dir, &dir);
-            let fm = read_front_matter(&found.path);
-            let skill = entry_for(&mut skills, &found.name, scope, &locks);
-            if skill.description.is_empty() {
-                skill.title = fm.name;
-                skill.description = fm.description.unwrap_or_default();
+    // 3. Everything each agent actually loads. An agent's own directory comes
+    //    first, so when it holds the skill too that entry is the one recorded.
+    for agent in AGENTS {
+        for (i, dir) in scope.agent_read_dirs(agent).into_iter().enumerate() {
+            for found in read_skill_dirs(&dir) {
+                let kind = if i == 0 || dir == canonical_dir {
+                    classify(&found.path, &canonical_dir, &dir)
+                } else {
+                    InstallKind::Inherited
+                };
+                let fm = read_front_matter(&found.path);
+                let skill = entry_for(&mut skills, &found.name, scope, &locks);
+                if skill.description.is_empty() {
+                    skill.title = fm.name;
+                    skill.description = fm.description.unwrap_or_default();
+                }
+                if skill.is_enabled_for(agent) {
+                    continue;
+                }
+                skill.installs.push(AgentInstall {
+                    agent,
+                    path: found.path,
+                    kind,
+                });
             }
-            skill.installs.push(AgentInstall {
-                agent,
-                path: found.path,
-                kind,
-            });
         }
     }
 
@@ -169,6 +187,11 @@ pub fn scan(scope: &Scope) -> Vec<Skill> {
     let mut out: Vec<Skill> = skills.into_values().collect();
     for skill in &mut out {
         skill.installs.sort_by_key(|i| i.agent.display);
+        // Measured once from wherever the files actually are, rather than per
+        // agent: every link points at the same content.
+        if let Some(path) = skill.content_path().map(Path::to_path_buf) {
+            skill.cost = tokens::measure(&path);
+        }
         if skill.lock.is_none() || skill.lock.as_ref().unwrap().github_owner_repo().is_none() {
             skill.update = UpdateState::NotTracked;
         }
@@ -221,7 +244,10 @@ mod tests {
         assert_eq!(alpha.canonical.as_deref(), Some(canonical.as_path()));
         assert!(alpha.is_enabled_for(by_key("claude-code").unwrap()));
         assert!(matches!(
-            alpha.install_for(by_key("claude-code").unwrap()).unwrap().kind,
+            alpha
+                .install_for(by_key("claude-code").unwrap())
+                .unwrap()
+                .kind,
             InstallKind::Symlink { .. }
         ));
     }
@@ -256,7 +282,10 @@ mod tests {
         let skills = scan(&scope);
         let claude_agent = by_key("claude-code").unwrap();
         let copied = skills.iter().find(|s| s.name == "copied").unwrap();
-        assert_eq!(copied.install_for(claude_agent).unwrap().kind, InstallKind::Copy);
+        assert_eq!(
+            copied.install_for(claude_agent).unwrap().kind,
+            InstallKind::Copy
+        );
         // A dangling link has no SKILL.md behind it, so it is not listed as a
         // skill at all — the scan reports only what an agent can actually load.
         assert!(skills.iter().all(|s| s.name != "orphan"));
@@ -278,6 +307,66 @@ mod tests {
         let (_root, scope) = fixture();
         write_skill(&scope.canonical_dir(), ".system", "Private agent data");
         assert!(scan(&scope).is_empty());
+    }
+
+    #[test]
+    fn agents_also_see_skills_in_the_other_directories_they_read() {
+        let (root, scope) = fixture();
+        let claude = root.join(".claude/skills");
+        std::fs::create_dir_all(&claude).unwrap();
+        write_skill(&claude, "from-claude", "Claude's copy");
+
+        let skills = scan(&scope);
+        let skill = skills.iter().find(|s| s.name == "from-claude").unwrap();
+        // OpenCode reads .claude/skills as well as its own directory, but the
+        // entry belongs to Claude Code: OpenCode must not be able to unlink it.
+        let install = skill.install_for(by_key("opencode").unwrap()).unwrap();
+        assert_eq!(install.kind, InstallKind::Inherited);
+        assert!(!install.kind.is_unlinkable());
+        let claude = skill.install_for(by_key("claude-code").unwrap()).unwrap();
+        assert_eq!(claude.kind, InstallKind::Copy);
+    }
+
+    #[test]
+    fn pi_and_omp_read_the_canonical_directory() {
+        let (_root, scope) = fixture();
+        write_skill(&scope.canonical_dir(), "shared", "Everyone");
+
+        let skills = scan(&scope);
+        let shared = skills.iter().find(|s| s.name == "shared").unwrap();
+        for key in ["pi", "omp"] {
+            let install = shared.install_for(by_key(key).unwrap()).unwrap();
+            assert_eq!(install.kind, InstallKind::Canonical, "{key}");
+        }
+    }
+
+    #[test]
+    fn an_agent_is_listed_once_even_when_several_of_its_directories_hold_the_skill() {
+        let (root, scope) = fixture();
+        let canonical = write_skill(&scope.canonical_dir(), "twice", "Linked and shared");
+        let omp = root.join(".omp/skills");
+        std::fs::create_dir_all(&omp).unwrap();
+        std::os::unix::fs::symlink(&canonical, omp.join("twice")).unwrap();
+
+        let skills = scan(&scope);
+        let twice = skills.iter().find(|s| s.name == "twice").unwrap();
+        let omp_agent = by_key("omp").unwrap();
+        let installs: Vec<_> = twice
+            .installs
+            .iter()
+            .filter(|i| i.agent.key == omp_agent.key)
+            .collect();
+        assert_eq!(installs.len(), 1);
+        // Its own directory wins over one it merely reads.
+        assert!(matches!(installs[0].kind, InstallKind::Symlink { .. }));
+    }
+
+    #[test]
+    fn codex_reads_the_global_canonical_directory() {
+        let codex = by_key("codex").unwrap();
+        let dirs = Scope::Global.agent_read_dirs(codex);
+        assert_eq!(dirs.first(), Scope::Global.agent_dir(codex).as_ref());
+        assert!(dirs.contains(&Scope::Global.canonical_dir()));
     }
 
     #[test]

@@ -16,7 +16,7 @@ and read-only update status.
 | --- | --- |
 | Install / update / uninstall | `skills` CLI |
 | Security review | skills.sh audit API (same data the CLI shows) |
-| Move between global and project | `skills add` + `skills remove` |
+| Move / copy between scopes | `skills add` (+ `skills remove` for a move) |
 | Enable / disable | Skillshard (filesystem) |
 | Link / unlink one agent | Skillshard (symlinks) |
 | Update *status* | Skillshard (GitHub trees API, read-only) |

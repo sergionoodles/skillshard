@@ -6,8 +6,8 @@ and [GPUI Kit](https://gpui-kit.com).
 Skills are installed by the [`skills` CLI](https://skills.sh), which is excellent at
 fetching them and has no opinion about what happens next. Skillshard is the missing
 other half: one window showing every skill across every agent, with the switches to
-turn them on and off, keep agents in sync, and move a skill between global and project
-scope.
+turn them on and off, keep agents in sync, and move or copy a skill between global and
+project scope.
 
 ## What it does
 
@@ -16,11 +16,10 @@ scope.
 * **Enable / disable** without uninstalling. A disabled skill is parked outside every
   agent's reach and restored, agents and all, when you switch it back on.
 * **Per-agent control** — tick an agent to link the skill into it, untick to unlink.
-  The canonical copy is never touched.
-* **Sync across agents** — bring one skill's coverage to every agent you use in a
-  single click.
-* **Move between global and project scope** — done by reinstalling through the CLI so
-  both lock files stay correct and update tracking survives the move.
+  The canonical copy is never touched. Only agents installed on this machine are
+  listed, detected by their own config directory (`~/.claude`, `~/.codex`, …).
+* **Move or copy between scopes** — to global or any project, done by reinstalling
+  through the CLI so both lock files stay correct and update tracking survives.
 * **Update status** — a read-only check against each skill's upstream, so you can see
   what is stale before changing anything. Updating itself is delegated to the CLI.
 * **Install with a security review** — every option (source, skills, agents, scope,

@@ -2,6 +2,7 @@
 
 use crate::agents::Agent;
 use crate::paths;
+use crate::tokens::TokenCost;
 use std::path::{Path, PathBuf};
 
 /// Where a set of skills lives: user-wide, or inside one project checkout.
@@ -69,6 +70,36 @@ impl Scope {
             Scope::Project(root) => Some(root.join(agent.project_dir)),
         }
     }
+
+    /// Every directory `agent` loads skills from in this scope, starting with
+    /// [`Scope::agent_dir`], which is the one Skillshard and the CLI write to.
+    pub fn agent_read_dirs(&self, agent: &Agent) -> Vec<PathBuf> {
+        let extras: Vec<PathBuf> = match self {
+            Scope::Global => agent
+                .extra_global_dirs()
+                .iter()
+                .map(|dir| paths::expand(dir))
+                .collect(),
+            Scope::Project(root) => agent
+                .extra_project_dirs()
+                .iter()
+                .map(|dir| root.join(dir))
+                .collect(),
+        };
+        let mut dirs: Vec<PathBuf> = self.agent_dir(agent).into_iter().collect();
+        for dir in extras {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        dirs
+    }
+
+    /// Whether `agent` sees every skill in the canonical directory, either
+    /// because that is its own directory or because it also reads it.
+    pub fn reads_canonical(&self, agent: &Agent) -> bool {
+        self.agent_read_dirs(agent).contains(&self.canonical_dir())
+    }
 }
 
 /// How a skill is present in one agent's skills directory.
@@ -83,12 +114,16 @@ pub enum InstallKind {
     /// The agent reads the canonical directory directly, so it cannot be
     /// unlinked without removing the skill itself.
     Canonical,
+    /// The agent also reads another agent's directory (OpenCode reading
+    /// `.claude/skills`) and finds the skill there. The entry belongs to that
+    /// other agent, so it is not this agent's to unlink.
+    Inherited,
 }
 
 impl InstallKind {
     /// Whether toggling this agent off is a link removal rather than a delete.
     pub fn is_unlinkable(&self) -> bool {
-        !matches!(self, InstallKind::Canonical)
+        !matches!(self, InstallKind::Canonical | InstallKind::Inherited)
     }
 }
 
@@ -138,6 +173,8 @@ pub struct Skill {
     /// Disabled by Skillshard: parked outside every agent's reach.
     pub disabled: bool,
     pub update: UpdateState,
+    /// Estimated context cost of the skill's files.
+    pub cost: TokenCost,
 }
 
 impl Skill {
@@ -205,5 +242,73 @@ impl LockEntry {
             return None;
         }
         Some(source)
+    }
+
+    /// A web page for the repository the skill was installed from, if it has one.
+    ///
+    /// Local sources and non-web remotes (e.g. `git@…`) have nothing to open.
+    pub fn repo_url(&self) -> Option<String> {
+        if let Some(url) = self.source_url.as_deref() {
+            if url.starts_with("https://") || url.starts_with("http://") {
+                return Some(url.trim_end_matches(".git").to_string());
+            }
+        }
+        self.github_owner_repo()
+            .map(|repo| format!("https://github.com/{repo}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(source: &str, source_type: &str, source_url: Option<&str>) -> LockEntry {
+        LockEntry {
+            source: source.into(),
+            source_type: source_type.into(),
+            source_url: source_url.map(Into::into),
+            skill_path: None,
+            git_ref: None,
+            hash: None,
+            hash_is_tree_sha: false,
+            installed_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn the_repo_url_drops_the_git_suffix() {
+        let lock = entry(
+            "owner/repo",
+            "github",
+            Some("https://github.com/owner/repo.git"),
+        );
+        assert_eq!(
+            lock.repo_url().as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+    }
+
+    #[test]
+    fn a_github_source_without_a_url_still_links_to_github() {
+        let lock = entry("owner/repo", "github", None);
+        assert_eq!(
+            lock.repo_url().as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+    }
+
+    #[test]
+    fn local_and_ssh_sources_have_no_repo_url() {
+        assert_eq!(entry("./local", "local", None).repo_url(), None);
+        assert_eq!(
+            entry(
+                "git@host:owner/repo.git",
+                "git",
+                Some("git@host:owner/repo.git")
+            )
+            .repo_url(),
+            None
+        );
     }
 }

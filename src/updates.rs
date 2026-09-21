@@ -57,9 +57,7 @@ fn folder_sha(tree: &TreeResponse, skill_path: &str) -> Option<String> {
 
 /// Fetch a repository tree for one ref.
 fn fetch_tree(owner_repo: &str, git_ref: &str) -> Result<TreeResponse, String> {
-    let url = format!(
-        "https://api.github.com/repos/{owner_repo}/git/trees/{git_ref}?recursive=1"
-    );
+    let url = format!("https://api.github.com/repos/{owner_repo}/git/trees/{git_ref}?recursive=1");
     let body = crate::registry::get(&url)?;
     serde_json::from_str(&body).map_err(|e| format!("unexpected tree response: {e}"))
 }

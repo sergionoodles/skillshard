@@ -18,7 +18,8 @@ pub struct Agent {
     pub global_dir: Option<&'static str>,
 }
 
-/// Every agent the `skills` CLI can install to.
+/// Every agent Skillshard knows about: all the `skills` CLI can install to,
+/// plus those in [`NOT_IN_CLI`].
 pub const AGENTS: &[Agent] = &[
     Agent {
         key: "adal",
@@ -333,6 +334,12 @@ pub const AGENTS: &[Agent] = &[
         global_dir: Some("~/.ona/skills"),
     },
     Agent {
+        key: "omp",
+        display: "OMP",
+        project_dir: ".omp/skills",
+        global_dir: Some("~/.omp/agent/skills"),
+    },
+    Agent {
         key: "openclaw",
         display: "OpenClaw",
         project_dir: "skills",
@@ -496,7 +503,117 @@ pub const AGENTS: &[Agent] = &[
     },
 ];
 
+/// Agents in [`AGENTS`] the `skills` CLI has no `--agent` key for.
+///
+/// Skillshard detects and links their skills itself, but must never pass
+/// their keys to the CLI.
+const NOT_IN_CLI: &[&str] = &["omp"];
+
+/// Global homes several agents share. The `skills` CLI creates them for any
+/// of those agents, so their existence says nothing about which is installed.
+const SHARED_HOMES: &[&str] = &["~/.agents", "~/.config/agents"];
+
+/// Directories an agent loads skills from besides its CLI install directory.
+struct ExtraDirs {
+    key: &'static str,
+    project: &'static [&'static str],
+    global: &'static [&'static str],
+}
+
+/// Only directories inside a project root or the home directory are listed;
+/// system-wide ones (Codex's `/etc/codex/skills`) are not a Skillshard scope.
+const EXTRA_DIRS: &[ExtraDirs] = &[
+    // https://learn.chatgpt.com/docs/build-skills
+    ExtraDirs {
+        key: "codex",
+        project: &[],
+        global: &["~/.agents/skills"],
+    },
+    // https://opencode.ai/docs/skills/
+    ExtraDirs {
+        key: "opencode",
+        project: &[".opencode/skills", ".claude/skills"],
+        global: &["~/.agents/skills", "~/.claude/skills"],
+    },
+    // https://pi.dev/docs/latest/skills
+    ExtraDirs {
+        key: "pi",
+        project: &[".agents/skills"],
+        global: &["~/.agents/skills"],
+    },
+    // https://omp.sh/docs/skills — Claude, Codex and OpenCode user
+    // directories are opt-in there, so only their project roots count.
+    ExtraDirs {
+        key: "omp",
+        project: &[
+            ".agents/skills",
+            ".agent/skills",
+            ".claude/skills",
+            ".codex/skills",
+            ".opencode/skills",
+            ".github/skills",
+        ],
+        global: &["~/.agents/skills", "~/.agent/skills"],
+    },
+];
+
+impl Agent {
+    /// Whether the `skills` CLI accepts this agent's key.
+    pub fn in_cli(&self) -> bool {
+        !NOT_IN_CLI.contains(&self.key)
+    }
+
+    /// Project-relative skills directories read besides [`Agent::project_dir`].
+    pub fn extra_project_dirs(&self) -> &'static [&'static str] {
+        self.extras().map_or(&[], |e| e.project)
+    }
+
+    /// `~`-relative skills directories read besides [`Agent::global_dir`].
+    pub fn extra_global_dirs(&self) -> &'static [&'static str] {
+        self.extras().map_or(&[], |e| e.global)
+    }
+
+    /// Whether the directory holding this agent's global skills directory
+    /// belongs to this agent alone. Agents create that directory themselves,
+    /// so when it is theirs, it existing is the sign they are installed.
+    ///
+    /// False for agents with no global directory, or one shared with other
+    /// agents: those cannot be detected.
+    pub fn has_own_home(&self) -> bool {
+        self.global_dir
+            .and_then(|dir| dir.strip_suffix("/skills"))
+            .is_some_and(|home| !SHARED_HOMES.contains(&home))
+    }
+
+    fn extras(&self) -> Option<&'static ExtraDirs> {
+        EXTRA_DIRS.iter().find(|e| e.key == self.key)
+    }
+}
+
 /// Look up an agent by its `--agent` key.
 pub fn by_key(key: &str) -> Option<&'static Agent> {
     AGENTS.iter().find(|a| a.key == key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agents_with_their_own_config_directory_can_be_detected() {
+        for key in ["claude-code", "pi", "goose", "github-copilot"] {
+            assert!(by_key(key).unwrap().has_own_home(), "{key}");
+        }
+    }
+
+    #[test]
+    fn agents_without_a_home_of_their_own_cannot_be_detected() {
+        // ~/.agents/skills is where the CLI puts every universal install.
+        assert!(!by_key("cline").unwrap().has_own_home());
+        assert!(!by_key("amp").unwrap().has_own_home());
+        assert!(AGENTS
+            .iter()
+            .filter(|a| a.global_dir.is_none())
+            .all(|a| !a.has_own_home()));
+    }
 }

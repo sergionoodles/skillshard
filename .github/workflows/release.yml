@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Linux AppImage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfontconfig1-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+      - name: Build
+        run: cargo build --locked --release
+      - name: Package AppImage
+        env:
+          APPIMAGE_NAME: skillshard-${{ github.ref_name }}-linux-x86_64.AppImage
+        run: |
+          mkdir -p AppDir/usr/bin \
+            AppDir/usr/share/applications \
+            AppDir/usr/share/icons/hicolor/scalable/apps
+          cp target/release/skillshard AppDir/usr/bin/skillshard
+          cat > AppDir/usr/share/applications/skillshard.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Skillshard
+          Exec=skillshard
+          Icon=skillshard
+          Categories=Utility;
+          EOF
+          cat > AppDir/usr/share/icons/hicolor/scalable/apps/skillshard.svg <<'EOF'
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+            <path d="M10.6 3.2 3.4 9.6 10.6 21.4Z" fill="#000"/>
+            <path d="M13.4 1.6 20.6 8 13.4 19.8Z" fill="#000"/>
+          </svg>
+          EOF
+          curl --fail --location --retry 3 \
+            --output linuxdeploy.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy.AppImage
+          LDAI_OUTPUT="$APPIMAGE_NAME" ./linuxdeploy.AppImage \
+            --appimage-extract-and-run \
+            --appdir AppDir \
+            --executable AppDir/usr/bin/skillshard \
+            --desktop-file AppDir/usr/share/applications/skillshard.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/skillshard.svg \
+            --output appimage
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-linux
+          path: skillshard-${{ github.ref_name }}-linux-x86_64.AppImage
+          if-no-files-found: error
+
+  macos:
+    name: macOS app
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --locked --release
+      - name: Package app
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          VERSION="${VERSION#v}"
+          mkdir -p dist/Skillshard.app/Contents/MacOS
+          cp target/release/skillshard dist/Skillshard.app/Contents/MacOS/skillshard
+          cat > dist/Skillshard.app/Contents/Info.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            <key>CFBundleExecutable</key><string>skillshard</string>
+            <key>CFBundleIdentifier</key><string>com.skillshard.app</string>
+            <key>CFBundleName</key><string>Skillshard</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+          </dict>
+          </plist>
+          EOF
+          ditto -c -k --sequesterRsrc --keepParent \
+            dist/Skillshard.app \
+            skillshard-${{ github.ref_name }}-macos-arm64.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-macos
+          path: skillshard-${{ github.ref_name }}-macos-arm64.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" --generate-notes
+          fi

@@ -10,12 +10,30 @@
 
 use crate::model::{LockEntry, UpdateState};
 use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::path::Path;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffLine {
+    Context(String),
+    Added(String),
+    Removed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: String,
+    pub lines: Vec<DiffLine>,
+    pub is_binary: bool,
+}
 
 #[derive(Debug, Deserialize)]
 struct TreeResponse {
     sha: String,
     #[serde(default)]
     tree: Vec<TreeEntry>,
+    #[serde(default)]
+    truncated: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +78,209 @@ fn fetch_tree(owner_repo: &str, git_ref: &str) -> Result<TreeResponse, String> {
     let url = format!("https://api.github.com/repos/{owner_repo}/git/trees/{git_ref}?recursive=1");
     let body = crate::registry::get(&url)?;
     serde_json::from_str(&body).map_err(|e| format!("unexpected tree response: {e}"))
+}
+
+fn upstream_tree(entry: &LockEntry) -> Result<(&str, String, TreeResponse), String> {
+    let owner_repo = entry.github_owner_repo().ok_or("not a GitHub skill")?;
+    let refs: Vec<&str> = entry
+        .git_ref
+        .as_deref()
+        .filter(|git_ref| !git_ref.is_empty())
+        .map(|git_ref| vec![git_ref])
+        .unwrap_or_else(|| vec!["main", "master"]);
+    let mut last_error = String::new();
+    for git_ref in refs {
+        match fetch_tree(owner_repo, git_ref) {
+            Ok(tree) if !tree.truncated => return Ok((owner_repo, git_ref.to_string(), tree)),
+            Ok(_) => return Err("upstream file list is incomplete".into()),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+/// Compare the installed skill folder with the files currently upstream.
+pub fn preview(entry: &LockEntry, installed: &Path) -> Result<Vec<FileDiff>, String> {
+    let skill_path = entry.skill_path.as_deref().ok_or("skill path is missing")?;
+    let (owner_repo, git_ref, tree) = upstream_tree(entry)?;
+    let folder = folder_path(skill_path);
+    if folder_sha(&tree, skill_path).is_none() {
+        return Err("skill is no longer present upstream".into());
+    }
+    let mut files = local_files(installed)?;
+    let mut changes = Vec::new();
+    for remote in tree.tree.iter().filter(|item| item.kind == "blob") {
+        let relative = if folder.is_empty() {
+            remote.path.as_str()
+        } else if let Some(relative) = remote.path.strip_prefix(&format!("{folder}/")) {
+            relative
+        } else {
+            continue;
+        };
+        if !safe_relative_path(relative) {
+            return Err(format!("unsafe upstream path: {relative}"));
+        }
+        let url = format!(
+            "https://raw.githubusercontent.com/{owner_repo}/{}/{}",
+            encode_path(&git_ref),
+            encode_path(&remote.path)
+        );
+        let upstream = fetch_bytes(&url)?;
+        if let Some(change) =
+            file_diff(relative.to_string(), files.remove(relative), Some(upstream))
+        {
+            changes.push(change);
+        }
+    }
+    changes.extend(
+        files
+            .into_iter()
+            .filter_map(|(path, current)| file_diff(path, Some(current), None)),
+    );
+    changes.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(changes)
+}
+
+fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let mut response = ureq::get(url)
+        .header(
+            "User-Agent",
+            concat!("skillshard/", env!("CARGO_PKG_VERSION")),
+        )
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .call()
+        .map_err(|error| error.to_string())?;
+    response
+        .body_mut()
+        .read_to_vec()
+        .map_err(|error| error.to_string())
+}
+
+fn encode_path(path: &str) -> String {
+    let mut encoded = String::new();
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn safe_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && Path::new(path)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+}
+
+fn local_files(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let mut files = BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                let path = entry.path();
+                let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
+                files.insert(
+                    relative.to_string_lossy().replace('\\', "/"),
+                    std::fs::read(path).map_err(|error| error.to_string())?,
+                );
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn file_diff(
+    path: String,
+    current: Option<Vec<u8>>,
+    upstream: Option<Vec<u8>>,
+) -> Option<FileDiff> {
+    if current == upstream {
+        return None;
+    }
+    let is_binary = [&current, &upstream]
+        .into_iter()
+        .flatten()
+        .any(|bytes| bytes.contains(&0) || std::str::from_utf8(bytes).is_err());
+    if is_binary {
+        return Some(FileDiff {
+            path,
+            lines: Vec::new(),
+            is_binary: true,
+        });
+    }
+    let current = current
+        .as_deref()
+        .map(|bytes| std::str::from_utf8(bytes).unwrap_or(""))
+        .unwrap_or("");
+    let upstream = upstream
+        .as_deref()
+        .map(|bytes| std::str::from_utf8(bytes).unwrap_or(""))
+        .unwrap_or("");
+    Some(FileDiff {
+        path,
+        lines: diff_lines(current, upstream),
+        is_binary: false,
+    })
+}
+
+fn diff_lines(current: &str, upstream: &str) -> Vec<DiffLine> {
+    let old: Vec<&str> = current.split_inclusive('\n').collect();
+    let new: Vec<&str> = upstream.split_inclusive('\n').collect();
+    let width = new.len() + 1;
+    // ponytail: Large files get a coarse diff; use a linear-space algorithm if they become common.
+    if old.len().saturating_mul(new.len()) > 1_000_000 {
+        return old
+            .iter()
+            .map(|line| DiffLine::Removed(display_line(line)))
+            .chain(new.iter().map(|line| DiffLine::Added(display_line(line))))
+            .collect();
+    }
+    let mut lengths = vec![0usize; (old.len() + 1) * width];
+    for i in (0..old.len()).rev() {
+        for j in (0..new.len()).rev() {
+            lengths[i * width + j] = if old[i] == new[j] {
+                1 + lengths[(i + 1) * width + j + 1]
+            } else {
+                lengths[(i + 1) * width + j].max(lengths[i * width + j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut lines = Vec::new();
+    while i < old.len() || j < new.len() {
+        if i < old.len() && j < new.len() && old[i] == new[j] {
+            lines.push(DiffLine::Context(display_line(old[i])));
+            i += 1;
+            j += 1;
+        } else if j < new.len()
+            && (i == old.len() || lengths[i * width + j + 1] > lengths[(i + 1) * width + j])
+        {
+            lines.push(DiffLine::Added(display_line(new[j])));
+            j += 1;
+        } else {
+            lines.push(DiffLine::Removed(display_line(old[i])));
+            i += 1;
+        }
+    }
+    lines
+}
+
+fn display_line(line: &str) -> String {
+    match line.strip_suffix('\n') {
+        Some(text) => text.to_string(),
+        None => format!("{line} [no newline]"),
+    }
 }
 
 /// Check whether `entry` has a newer version upstream.
@@ -111,6 +332,7 @@ mod tests {
     fn tree() -> TreeResponse {
         TreeResponse {
             sha: "roottree".into(),
+            truncated: false,
             tree: vec![
                 TreeEntry {
                     path: "skills".into(),
@@ -179,5 +401,59 @@ mod tests {
             ..local.clone()
         };
         assert_eq!(check(&project), UpdateState::NotTracked);
+    }
+
+    #[test]
+    fn preview_lines_keep_context_and_show_insertions_and_removals() {
+        assert_eq!(
+            diff_lines("first\nold\nlast\n", "first\nnew\nlast\n"),
+            vec![
+                DiffLine::Context("first".into()),
+                DiffLine::Removed("old".into()),
+                DiffLine::Added("new".into()),
+                DiffLine::Context("last".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn preview_handles_added_removed_and_binary_files() {
+        let added = file_diff("new.txt".into(), None, Some(b"hello\n".to_vec())).unwrap();
+        assert_eq!(added.lines, vec![DiffLine::Added("hello".into())]);
+        let removed = file_diff("gone.txt".into(), Some(b"bye\n".to_vec()), None).unwrap();
+        assert_eq!(removed.lines, vec![DiffLine::Removed("bye".into())]);
+        let binary = file_diff("image.png".into(), Some(vec![0, 1]), Some(vec![0, 2])).unwrap();
+        assert!(binary.is_binary);
+        assert!(file_diff("same".into(), Some(b"x".to_vec()), Some(b"x".to_vec())).is_none());
+    }
+
+    #[test]
+    fn preview_shows_a_changed_final_newline() {
+        assert_eq!(
+            diff_lines("hello", "hello\n"),
+            vec![
+                DiffLine::Removed("hello [no newline]".into()),
+                DiffLine::Added("hello".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn preview_rejects_a_non_github_source() {
+        let entry = LockEntry {
+            source: "./local".into(),
+            source_type: "local".into(),
+            source_url: None,
+            skill_path: Some("SKILL.md".into()),
+            git_ref: None,
+            hash: None,
+            hash_is_tree_sha: false,
+            installed_at: None,
+            updated_at: None,
+        };
+        assert_eq!(
+            preview(&entry, Path::new(".")),
+            Err("not a GitHub skill".into())
+        );
     }
 }

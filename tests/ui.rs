@@ -423,6 +423,43 @@ fn a_wide_list_labels_the_update_and_a_narrow_one_uses_an_arrow(cx: &mut TestApp
 }
 
 #[gpui_kit::test]
+fn an_available_update_opens_and_closes_the_diff_preview(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("diff-preview", &["alpha"]);
+    let Scope::Project(root) = &scope else {
+        unreachable!()
+    };
+    std::fs::write(
+        root.join("skills-lock.json"),
+        r#"{"skills":{"alpha":{"source":"./local","sourceType":"local","skillPath":"SKILL.md"}}}"#,
+    )
+    .unwrap();
+    let (handle, view) = open(&scope, 1180., cx);
+    cx.update(|cx| {
+        view.update(cx, |this, cx| {
+            this.apply_update_states(vec![("alpha".into(), UpdateState::Available)], cx);
+        })
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("row-alpha", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("diff-preview").is_some());
+        window.click("diff-preview", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("close-diff").is_some());
+        window.click("close-diff", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("close-diff").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn long_names_and_descriptions_stay_inside_the_row(cx: &mut TestAppContext) {
     init(cx);
     let root = std::env::temp_dir().join(format!("skillshard-ui-trunc-{}", std::process::id()));

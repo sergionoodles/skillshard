@@ -1,6 +1,7 @@
 //! The desktop interface.
 
 pub mod app;
+pub mod diff;
 pub mod install;
 pub mod project_settings;
 pub mod settings;

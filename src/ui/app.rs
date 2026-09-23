@@ -54,6 +54,7 @@ pub struct Skillshard {
     install: Option<Entity<super::install::InstallDialog>>,
     settings: Option<Entity<super::settings::SettingsDialog>>,
     project_settings: Option<Entity<super::project_settings::ProjectSettingsDialog>>,
+    diff: Option<Entity<super::diff::DiffDialog>>,
     /// skills.sh install counts, keyed by [`install_key`].
     installs: HashMap<String, u64>,
     /// Counts already asked for, so re-scans do not repeat in-flight lookups.
@@ -172,6 +173,7 @@ impl Skillshard {
             install: None,
             settings: None,
             project_settings: None,
+            diff: None,
             installs: HashMap::new(),
             installs_requested: HashSet::new(),
             installed: scan::installed_agents(),
@@ -1058,6 +1060,16 @@ impl Skillshard {
                                     move |this, _, _, cx| this.update_skill(name.clone(), cx)
                                 })),
                         )
+                        .child(
+                            Button::new("diff-preview")
+                                .small()
+                                .label("Diff preview")
+                                .disabled(skill.lock.is_none() || skill.content_path().is_none())
+                                .on_click(cx.listener({
+                                    let name = name.clone();
+                                    move |this, _, _, cx| this.open_diff(&name, cx)
+                                })),
+                        )
                     })
                     .child(self.render_transfer_button(Transfer::Move, &name, cx))
                     .child(self.render_transfer_button(Transfer::Copy, &name, cx))
@@ -1791,6 +1803,7 @@ impl Render for Skillshard {
             .children(self.install.clone())
             .children(self.settings.clone())
             .children(self.project_settings.clone())
+            .children(self.diff.clone())
             .when_some(self.offered_project.clone(), |this, path| {
                 this.child(self.render_add_project(&path, cx))
             })
@@ -1800,6 +1813,30 @@ impl Render for Skillshard {
 // ─── Dialog, projects and scope moves ───
 
 impl Skillshard {
+    fn open_diff(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(skill) = self.skills.iter().find(|skill| skill.name == name) else {
+            return;
+        };
+        let (Some(entry), Some(installed)) = (skill.lock.clone(), skill.content_path()) else {
+            return;
+        };
+        let dialog = cx.new(|cx| {
+            super::diff::DiffDialog::new(
+                skill.display_name().to_string(),
+                entry,
+                installed.to_path_buf(),
+                cx,
+            )
+        });
+        cx.subscribe(&dialog, |this, _, _, cx| {
+            this.diff = None;
+            cx.notify();
+        })
+        .detach();
+        self.diff = Some(dialog);
+        cx.notify();
+    }
+
     /// Open the install dialog, pre-filled for the active scope.
     fn open_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let agents = self.shown_agents();

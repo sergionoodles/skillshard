@@ -423,7 +423,7 @@ fn a_wide_list_labels_the_update_and_a_narrow_one_uses_an_arrow(cx: &mut TestApp
 }
 
 #[gpui_kit::test]
-fn an_available_update_opens_and_closes_the_diff_preview(cx: &mut TestAppContext) {
+fn an_available_update_requires_the_diff_modal(cx: &mut TestAppContext) {
     init(cx);
     let scope = fixture("diff-preview", &["alpha"]);
     let Scope::Project(root) = &scope else {
@@ -435,6 +435,7 @@ fn an_available_update_opens_and_closes_the_diff_preview(cx: &mut TestAppContext
     )
     .unwrap();
     let (handle, view) = open(&scope, 1180., cx);
+    cx.run_until_parked();
     cx.update(|cx| {
         view.update(cx, |this, cx| {
             this.apply_update_states(vec![("alpha".into(), UpdateState::Available)], cx);
@@ -444,10 +445,19 @@ fn an_available_update_opens_and_closes_the_diff_preview(cx: &mut TestAppContext
         window.render_frame(cx);
         window.click("row-alpha", cx);
         window.render_frame(cx);
-        assert!(window.try_find("diff-preview").is_some());
-        window.click("diff-preview", cx);
+        assert!(window.try_find("do-update").is_none());
+        assert!(window.try_find("diff-preview").is_none());
+        assert!(window.try_find("diff-and-update").is_some());
+        window.click("diff-and-update", cx);
         window.render_frame(cx);
         assert!(window.try_find("close-diff").is_some());
+        assert!(window.try_find("confirm-update").is_some());
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("confirm-update").is_some());
         window.click("close-diff", cx);
     })
     .unwrap();

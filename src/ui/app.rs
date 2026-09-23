@@ -21,6 +21,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Width of both side panes: the scope sidebar and the detail pane.
 const SIDE_PANE_WIDTH: f32 = 300.;
@@ -55,6 +56,7 @@ pub struct Skillshard {
     settings: Option<Entity<super::settings::SettingsDialog>>,
     project_settings: Option<Entity<super::project_settings::ProjectSettingsDialog>>,
     diff: Option<Entity<super::diff::DiffDialog>>,
+    update_trees: Option<Arc<updates::TreeCache>>,
     /// skills.sh install counts, keyed by [`install_key`].
     installs: HashMap<String, u64>,
     /// Counts already asked for, so re-scans do not repeat in-flight lookups.
@@ -174,6 +176,7 @@ impl Skillshard {
             settings: None,
             project_settings: None,
             diff: None,
+            update_trees: None,
             installs: HashMap::new(),
             installs_requested: HashSet::new(),
             installed: scan::installed_agents(),
@@ -253,6 +256,7 @@ impl Skillshard {
 
     /// Re-scan the active scope from disk.
     fn reload(&mut self, cx: &mut Context<Self>) {
+        self.update_trees = None;
         let scope = self.scope().clone();
         self.skills = scan::scan(&scope);
         // Only when global is one of the window's scopes: the UI tests leave
@@ -341,6 +345,7 @@ impl Skillshard {
 
     /// Check every tracked skill against its upstream source.
     fn check_updates(&mut self, cx: &mut Context<Self>) {
+        let scope = self.scope().clone();
         let entries: Vec<(String, crate::model::LockEntry)> = self
             .skills
             .iter()
@@ -350,6 +355,7 @@ impl Skillshard {
             self.log("no tracked skills to check", false);
             return;
         }
+        self.update_trees = None;
         for skill in &mut self.skills {
             if skill.lock.is_some() {
                 skill.update = UpdateState::Checking;
@@ -360,18 +366,17 @@ impl Skillshard {
 
         cx.spawn(async move |this, cx| {
             // Network work belongs off the UI thread.
-            let checked = cx
+            let (checked, trees) = cx
                 .background_executor()
-                .spawn(async move {
-                    entries
-                        .into_iter()
-                        .map(|(name, entry)| (name, updates::check(&entry)))
-                        .collect::<Vec<_>>()
-                })
+                .spawn(async move { updates::check_many(entries) })
                 .await;
 
             this.update(cx, |this, cx| {
                 this.busy = None;
+                if this.scope() != &scope {
+                    return;
+                }
+                this.update_trees = Some(Arc::new(trees));
                 this.apply_update_states(checked, cx);
             })
             .ok();
@@ -1050,21 +1055,15 @@ impl Skillshard {
                     .flex_wrap()
                     .when(skill.update == UpdateState::Available, |this| {
                         this.child(
-                            Button::new("do-update")
+                            Button::new("diff-and-update")
                                 .primary()
                                 .small()
-                                .label("Update")
-                                .disabled(self.busy.is_some())
-                                .on_click(cx.listener({
-                                    let name = name.clone();
-                                    move |this, _, _, cx| this.update_skill(name.clone(), cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("diff-preview")
-                                .small()
-                                .label("Diff preview")
-                                .disabled(skill.lock.is_none() || skill.content_path().is_none())
+                                .label("Diff & Update")
+                                .disabled(
+                                    self.busy.is_some()
+                                        || skill.lock.is_none()
+                                        || skill.content_path().is_none(),
+                                )
                                 .on_click(cx.listener({
                                     let name = name.clone();
                                     move |this, _, _, cx| this.open_diff(&name, cx)
@@ -1825,11 +1824,16 @@ impl Skillshard {
                 skill.display_name().to_string(),
                 entry,
                 installed.to_path_buf(),
+                self.update_trees.clone(),
                 cx,
             )
         });
-        cx.subscribe(&dialog, |this, _, _, cx| {
+        let update_name = skill.name.clone();
+        cx.subscribe(&dialog, move |this, _, event, cx| {
             this.diff = None;
+            if matches!(event, super::diff::DiffEvent::Update) {
+                this.update_skill(update_name.clone(), cx);
+            }
             cx.notify();
         })
         .detach();

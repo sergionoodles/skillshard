@@ -12,6 +12,7 @@ use crate::model::{LockEntry, UpdateState};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffLine {
@@ -42,6 +43,12 @@ struct TreeEntry {
     #[serde(rename = "type")]
     kind: String,
     sha: String,
+}
+
+/// Repository trees fetched during one update check, for reuse by previews.
+#[derive(Default)]
+pub struct TreeCache {
+    trees: BTreeMap<(String, String), Result<Arc<TreeResponse>, String>>,
 }
 
 /// Strip a trailing `SKILL.md` to get the skill's folder path within the repo.
@@ -80,7 +87,18 @@ fn fetch_tree(owner_repo: &str, git_ref: &str) -> Result<TreeResponse, String> {
     serde_json::from_str(&body).map_err(|e| format!("unexpected tree response: {e}"))
 }
 
-fn upstream_tree(entry: &LockEntry) -> Result<(&str, String, TreeResponse), String> {
+fn upstream_tree<'a>(
+    entry: &'a LockEntry,
+    cache: Option<&TreeCache>,
+) -> Result<(&'a str, String, Arc<TreeResponse>), String> {
+    upstream_tree_with(entry, cache, fetch_tree)
+}
+
+fn upstream_tree_with<'a>(
+    entry: &'a LockEntry,
+    cache: Option<&TreeCache>,
+    mut fetch: impl FnMut(&str, &str) -> Result<TreeResponse, String>,
+) -> Result<(&'a str, String, Arc<TreeResponse>), String> {
     let owner_repo = entry.github_owner_repo().ok_or("not a GitHub skill")?;
     let refs: Vec<&str> = entry
         .git_ref
@@ -90,7 +108,16 @@ fn upstream_tree(entry: &LockEntry) -> Result<(&str, String, TreeResponse), Stri
         .unwrap_or_else(|| vec!["main", "master"]);
     let mut last_error = String::new();
     for git_ref in refs {
-        match fetch_tree(owner_repo, git_ref) {
+        let cached = cache.and_then(|cache| {
+            cache
+                .trees
+                .get(&(owner_repo.to_string(), git_ref.to_string()))
+        });
+        let result = match cached {
+            Some(result) => result.clone(),
+            None => fetch(owner_repo, git_ref).map(Arc::new),
+        };
+        match result {
             Ok(tree) if !tree.truncated => return Ok((owner_repo, git_ref.to_string(), tree)),
             Ok(_) => return Err("upstream file list is incomplete".into()),
             Err(error) => last_error = error,
@@ -101,8 +128,17 @@ fn upstream_tree(entry: &LockEntry) -> Result<(&str, String, TreeResponse), Stri
 
 /// Compare the installed skill folder with the files currently upstream.
 pub fn preview(entry: &LockEntry, installed: &Path) -> Result<Vec<FileDiff>, String> {
+    preview_with_cache(entry, installed, None)
+}
+
+/// Preview using trees already fetched by an update check when available.
+pub fn preview_with_cache(
+    entry: &LockEntry,
+    installed: &Path,
+    cache: Option<&TreeCache>,
+) -> Result<Vec<FileDiff>, String> {
     let skill_path = entry.skill_path.as_deref().ok_or("skill path is missing")?;
-    let (owner_repo, git_ref, tree) = upstream_tree(entry)?;
+    let (owner_repo, git_ref, tree) = upstream_tree(entry, cache)?;
     let folder = folder_path(skill_path);
     if folder_sha(&tree, skill_path).is_none() {
         return Err("skill is no longer present upstream".into());
@@ -289,6 +325,34 @@ fn display_line(line: &str) -> String {
 /// anything else the state is [`UpdateState::NotTracked`], which the UI shows
 /// as "check with the CLI" rather than pretending it is current.
 pub fn check(entry: &LockEntry) -> UpdateState {
+    check_with_cache(entry, &mut TreeCache::default(), &mut fetch_tree)
+}
+
+/// Check a set of skills, fetching each repository tree only once per ref.
+pub fn check_many(entries: Vec<(String, LockEntry)>) -> (Vec<(String, UpdateState)>, TreeCache) {
+    check_many_with(entries, fetch_tree)
+}
+
+fn check_many_with(
+    entries: Vec<(String, LockEntry)>,
+    mut fetch: impl FnMut(&str, &str) -> Result<TreeResponse, String>,
+) -> (Vec<(String, UpdateState)>, TreeCache) {
+    let mut cache = TreeCache::default();
+    let states = entries
+        .into_iter()
+        .map(|(name, entry)| {
+            let state = check_with_cache(&entry, &mut cache, &mut fetch);
+            (name, state)
+        })
+        .collect();
+    (states, cache)
+}
+
+fn check_with_cache(
+    entry: &LockEntry,
+    cache: &mut TreeCache,
+    fetch: &mut impl FnMut(&str, &str) -> Result<TreeResponse, String>,
+) -> UpdateState {
     let Some(owner_repo) = entry.github_owner_repo() else {
         return UpdateState::NotTracked;
     };
@@ -302,16 +366,20 @@ pub fn check(entry: &LockEntry) -> UpdateState {
     }
 
     // Honour a pinned ref, otherwise try the usual default branches.
-    let refs: Vec<String> = match &entry.git_ref {
-        Some(r) if !r.is_empty() => vec![r.clone()],
-        _ => vec!["main".into(), "master".into()],
+    let refs: Vec<&str> = match entry.git_ref.as_deref() {
+        Some(git_ref) if !git_ref.is_empty() => vec![git_ref],
+        _ => vec!["main", "master"],
     };
 
     let mut last_error = None;
     for git_ref in refs {
-        match fetch_tree(owner_repo, &git_ref) {
+        let tree = cache
+            .trees
+            .entry((owner_repo.to_string(), git_ref.to_string()))
+            .or_insert_with(|| fetch(owner_repo, git_ref).map(Arc::new));
+        match tree {
             Ok(tree) => {
-                return match folder_sha(&tree, skill_path) {
+                return match folder_sha(tree, skill_path) {
                     Some(upstream) if &upstream == locked_hash => UpdateState::UpToDate,
                     Some(_) => UpdateState::Available,
                     // The folder is gone upstream: the skill was moved or
@@ -319,7 +387,7 @@ pub fn check(entry: &LockEntry) -> UpdateState {
                     None => UpdateState::Failed("no longer present upstream".into()),
                 };
             }
-            Err(e) => last_error = Some(e),
+            Err(error) => last_error = Some(error.clone()),
         }
     }
     UpdateState::Failed(last_error.unwrap_or_else(|| "could not reach GitHub".into()))
@@ -401,6 +469,76 @@ mod tests {
             ..local.clone()
         };
         assert_eq!(check(&project), UpdateState::NotTracked);
+    }
+
+    #[test]
+    fn checks_shared_repository_trees_once_per_ref() {
+        let entry = LockEntry {
+            source: "owner/repo".into(),
+            source_type: "github".into(),
+            source_url: None,
+            skill_path: Some("skills/ponytail/SKILL.md".into()),
+            git_ref: None,
+            hash: Some("cb6e534".into()),
+            hash_is_tree_sha: true,
+            installed_at: None,
+            updated_at: None,
+        };
+        let mut stale = entry.clone();
+        stale.hash = Some("old".into());
+        let mut pinned = entry.clone();
+        pinned.git_ref = Some("release".into());
+        let mut other_repo = entry.clone();
+        other_repo.source = "other/repo".into();
+        let mut untracked = entry.clone();
+        untracked.hash_is_tree_sha = false;
+
+        let mut calls = Vec::new();
+        let (states, cache) = check_many_with(
+            vec![
+                ("current".into(), entry.clone()),
+                ("stale".into(), stale),
+                ("pinned".into(), pinned),
+                ("other".into(), other_repo),
+                ("untracked".into(), untracked),
+            ],
+            |repo, git_ref| {
+                calls.push((repo.to_string(), git_ref.to_string()));
+                if git_ref == "main" {
+                    Err("missing branch".into())
+                } else {
+                    Ok(tree())
+                }
+            },
+        );
+
+        assert_eq!(
+            states,
+            vec![
+                ("current".into(), UpdateState::UpToDate),
+                ("stale".into(), UpdateState::Available),
+                ("pinned".into(), UpdateState::UpToDate),
+                ("other".into(), UpdateState::UpToDate),
+                ("untracked".into(), UpdateState::NotTracked),
+            ]
+        );
+        assert_eq!(
+            calls,
+            vec![
+                ("owner/repo".into(), "main".into()),
+                ("owner/repo".into(), "master".into()),
+                ("owner/repo".into(), "release".into()),
+                ("other/repo".into(), "main".into()),
+                ("other/repo".into(), "master".into()),
+            ]
+        );
+        let (_, git_ref, cached_tree) =
+            upstream_tree_with(&entry, Some(&cache), |_, _| panic!("unexpected request")).unwrap();
+        assert_eq!(git_ref, "master");
+        assert_eq!(
+            folder_sha(&cached_tree, entry.skill_path.as_deref().unwrap()).as_deref(),
+            Some("cb6e534")
+        );
     }
 
     #[test]

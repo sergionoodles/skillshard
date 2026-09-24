@@ -166,16 +166,15 @@ pub fn disable(skill: &Skill) -> Result<()> {
     // it through the shared canonical directory.
     let agents: Vec<String> = skill.installs.iter().map(|i| i.agent.key.into()).collect();
 
+    let parked = skill.scope.disabled_dir().join(&skill.name);
+    remove_entry(&parked)?;
+
     for install in &skill.installs {
         if install.kind.is_unlinkable() {
             remove_entry(&install.path)?;
         }
     }
 
-    let parked = skill.scope.disabled_dir().join(&skill.name);
-    if parked.exists() {
-        return Err(OpError::Occupied(parked));
-    }
     std::fs::create_dir_all(skill.scope.disabled_dir())?;
     move_dir(&source, &parked)?;
 
@@ -403,5 +402,28 @@ mod tests {
         assert!(!on.disabled);
         assert!(on.is_enabled_for(claude), "previous agents are restored");
         assert!(scope.canonical_dir().join("gamma").is_dir());
+    }
+
+    #[test]
+    fn disable_replaces_an_existing_parked_copy() {
+        let scope = fixture("replace-parked");
+        write_skill(&scope, "gamma");
+        let parked = scope.disabled_dir().join("gamma");
+        std::fs::create_dir_all(&parked).unwrap();
+        std::fs::write(
+            parked.join("SKILL.md"),
+            "---\nname: gamma\ndescription: stale copy\n---\n",
+        )
+        .unwrap();
+        std::fs::write(parked.join("old.txt"), "stale copy").unwrap();
+
+        disable(&get(&scope, "gamma")).unwrap();
+
+        let parked = scope.disabled_dir().join("gamma");
+        assert!(parked.join("SKILL.md").is_file());
+        assert!(std::fs::read_to_string(parked.join("SKILL.md"))
+            .unwrap()
+            .contains("description: d"));
+        assert!(!parked.join("old.txt").exists());
     }
 }

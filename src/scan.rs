@@ -142,8 +142,11 @@ pub fn scan(scope: &Scope) -> Vec<Skill> {
 
     // 2. Skills Skillshard has parked out of every agent's reach.
     for found in read_skill_dirs(&disabled_dir) {
-        let fm = read_front_matter(&found.path);
         let skill = entry_for(&mut skills, &found.name, scope, &locks);
+        if skill.canonical.is_some() {
+            continue;
+        }
+        let fm = read_front_matter(&found.path);
         skill.disabled = true;
         skill.canonical = Some(found.path);
         skill.title = fm.name;
@@ -300,6 +303,19 @@ mod tests {
         let gamma = skills.iter().find(|s| s.name == "gamma").unwrap();
         assert!(gamma.disabled);
         assert!(gamma.installs.is_empty());
+    }
+
+    #[test]
+    fn canonical_copy_wins_over_a_parked_copy_with_the_same_name() {
+        let (_root, scope) = fixture();
+        let canonical = write_skill(&scope.canonical_dir(), "gamma", "Installed again");
+        write_skill(&scope.disabled_dir(), "gamma", "Old disabled copy");
+
+        let skills = scan(&scope);
+        let gamma = skills.iter().find(|s| s.name == "gamma").unwrap();
+        assert!(!gamma.disabled);
+        assert_eq!(gamma.canonical.as_deref(), Some(canonical.as_path()));
+        assert!(gamma.description.contains("Installed again"));
     }
 
     #[test]

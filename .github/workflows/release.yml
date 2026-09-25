@@ -101,13 +101,19 @@ jobs:
           </dict>
           </plist>
           EOF
-          ditto -c -k --sequesterRsrc --keepParent \
-            dist/Skillshard.app \
-            skillshard-${{ github.ref_name }}-macos-arm64.zip
+          mkdir -p dist/dmg
+          cp -R dist/Skillshard.app dist/dmg/
+          ln -s /Applications dist/dmg/Applications
+          hdiutil create \
+            -volname Skillshard \
+            -srcfolder dist/dmg \
+            -ov \
+            -format UDZO \
+            skillshard-${{ github.ref_name }}-macos.dmg
       - uses: actions/upload-artifact@v7
         with:
           name: release-macos
-          path: skillshard-${{ github.ref_name }}-macos-arm64.zip
+          path: skillshard-${{ github.ref_name }}-macos.dmg
           if-no-files-found: error
 
   release:

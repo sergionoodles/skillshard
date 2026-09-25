@@ -68,6 +68,8 @@ pub struct Skillshard {
     /// A folder a skill was just sent to, while asking whether it should join
     /// the sidebar as a project.
     offered_project: Option<PathBuf>,
+    /// Folders chosen in the picker, awaiting confirmation.
+    pending_projects: Option<Vec<PathBuf>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -182,6 +184,7 @@ impl Skillshard {
             installed: scan::installed_agents(),
             editors: editors::detect(),
             offered_project: None,
+            pending_projects: None,
             _subscriptions: subscriptions,
         };
         this.report_preferences_error(cx);
@@ -1776,6 +1779,100 @@ impl Skillshard {
                     .test_support(),
             )
     }
+
+    fn render_import_projects(
+        &self,
+        projects: &[PathBuf],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let new_count = projects
+            .iter()
+            .filter(|path| !self.scopes.contains(&Scope::Project((*path).clone())))
+            .count();
+        let parent = projects[0]
+            .parent()
+            .expect("selected projects have a parent");
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(hsla(0., 0., 0., 0.45))
+            .child(
+                v_flex()
+                    .id("import-projects-dialog")
+                    .w(px(480.))
+                    .p_5()
+                    .gap_4()
+                    .rounded(cx.theme().radius_lg)
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .font_semibold()
+                            .child(format!("Add {}?", plural(new_count, "project"))),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("From {}", paths::shorten(parent))),
+                    )
+                    .child(
+                        div()
+                            .id("import-project-list")
+                            .max_h(px(300.))
+                            .overflow_y_scroll()
+                            .child(v_flex().gap_2().children(projects.iter().map(|path| {
+                                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                                let is_added = self.scopes.contains(&Scope::Project(path.clone()));
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(Icon::new(IconName::Folder))
+                                    .child(div().flex_1().min_w_0().truncate().child(name))
+                                    .when(is_added, |row| {
+                                        row.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("Already added"),
+                                        )
+                                    })
+                            }))),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("cancel-import-projects")
+                                    .small()
+                                    .ghost()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.pending_projects = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("confirm-import-projects")
+                                    .small()
+                                    .primary()
+                                    .label(format!("Add {}", plural(new_count, "project")))
+                                    .disabled(new_count == 0)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.confirm_projects(cx)),
+                                    ),
+                            ),
+                    )
+                    .test_support(),
+            )
+    }
 }
 
 impl Render for Skillshard {
@@ -1805,6 +1902,9 @@ impl Render for Skillshard {
             .children(self.diff.clone())
             .when_some(self.offered_project.clone(), |this, path| {
                 this.child(self.render_add_project(&path, cx))
+            })
+            .when_some(self.pending_projects.clone(), |this, projects| {
+                this.child(self.render_import_projects(&projects, cx))
             })
     }
 }
@@ -1955,30 +2055,77 @@ impl Skillshard {
         self.run_steps(label, vec![(request.args(), cwd)], |_, _| {}, cx);
     }
 
-    /// Add a project directory to the scope list.
+    /// Choose sibling project directories, then review them before adding any.
     fn pick_project(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
-            multiple: false,
-            prompt: Some("Choose project".into()),
+            multiple: true,
+            prompt: Some("Choose projects".into()),
         });
 
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(chosen))) = paths.await else {
                 return;
             };
-            let Some(root) = chosen.into_iter().next() else {
-                return;
-            };
             this.update(cx, |this, cx| {
-                this.active_scope = this.add_project(root, cx);
-                this.selected = None;
-                this.reload(cx);
+                this.review_projects(chosen, cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    fn review_projects(&mut self, chosen: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let mut projects = Vec::new();
+        for path in chosen {
+            if !projects.contains(&path) {
+                projects.push(path);
+            }
+        }
+        if projects.is_empty() {
+            return;
+        }
+        let parent = projects[0].parent();
+        if parent.is_none()
+            || projects
+                .iter()
+                .any(|path| !path.is_dir() || path.parent() != parent)
+        {
+            self.log("choose project folders from the same parent folder", true);
+            cx.notify();
+            return;
+        }
+        self.pending_projects = Some(projects);
+        cx.notify();
+    }
+
+    fn confirm_projects(&mut self, cx: &mut Context<Self>) {
+        let Some(projects) = self.pending_projects.take() else {
+            return;
+        };
+        preferences::update(cx, |prefs| {
+            for path in &projects {
+                prefs.project_mut(path);
+            }
+        });
+        let mut first_index = None;
+        for path in projects {
+            let scope = Scope::Project(path);
+            let index = match self.scopes.iter().position(|saved| saved == &scope) {
+                Some(index) => index,
+                None => {
+                    self.scopes.push(scope);
+                    self.scopes.len() - 1
+                }
+            };
+            first_index.get_or_insert(index);
+        }
+        if let Some(index) = first_index {
+            self.active_scope = index;
+            self.selected = None;
+            self.reload(cx);
+        }
     }
 
     /// Put a project in the sidebar and preferences, returning its index.

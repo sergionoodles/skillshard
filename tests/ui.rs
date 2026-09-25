@@ -779,6 +779,103 @@ fn saved_projects_are_restored_in_the_sidebar(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+#[gpui_kit::test]
+fn selected_sibling_projects_wait_for_confirmation(cx: &mut TestAppContext) {
+    init(cx);
+    let Scope::Project(first) = fixture("bulk-first", &["alpha"]) else {
+        unreachable!()
+    };
+    let Scope::Project(second) = fixture("bulk-second", &["beta"]) else {
+        unreachable!()
+    };
+    let (handle, _) = open(&Scope::Global, 1180., cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("open-project", cx);
+    })
+    .unwrap();
+    cx.simulate_path_prompt_response(|options| {
+        assert!(options.directories && options.multiple && !options.files);
+        Some(vec![first.clone(), second.clone(), first.clone()])
+    });
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("import-projects-dialog").is_some());
+        assert!(window.try_find("scope-1").is_none());
+    })
+    .unwrap();
+    cx.update(|cx| assert!(skillshard::preferences::get(cx).projects.is_empty()));
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("confirm-import-projects", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("import-projects-dialog").is_none());
+        assert!(window.try_find("scope-1").is_some());
+        assert!(window.try_find("scope-2").is_some());
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let projects = &skillshard::preferences::get(cx).projects;
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].path, first);
+        assert_eq!(projects[1].path, second);
+    });
+}
+
+#[gpui_kit::test]
+fn cancelling_project_review_imports_nothing(cx: &mut TestAppContext) {
+    init(cx);
+    let Scope::Project(project) = fixture("bulk-cancel", &[]) else {
+        unreachable!()
+    };
+    std::fs::create_dir_all(&project).unwrap();
+    let (handle, _) = open(&Scope::Global, 1180., cx);
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("open-project", cx);
+    })
+    .unwrap();
+    cx.simulate_path_prompt_response(|_| Some(vec![project.clone()]));
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("cancel-import-projects", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("import-projects-dialog").is_none());
+        assert!(window.try_find("scope-1").is_none());
+    })
+    .unwrap();
+    cx.update(|cx| assert!(skillshard::preferences::get(cx).projects.is_empty()));
+}
+
+#[gpui_kit::test]
+fn projects_from_different_parents_are_rejected(cx: &mut TestAppContext) {
+    init(cx);
+    let Scope::Project(first) = fixture("bulk-valid", &[]) else {
+        unreachable!()
+    };
+    std::fs::create_dir_all(&first).unwrap();
+    let other = first.join("nested");
+    std::fs::create_dir_all(&other).unwrap();
+    let (handle, _) = open(&Scope::Global, 1180., cx);
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("open-project", cx);
+    })
+    .unwrap();
+    cx.simulate_path_prompt_response(|_| Some(vec![first, other]));
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("import-projects-dialog").is_none());
+        assert!(window.try_find("scope-1").is_none());
+    })
+    .unwrap();
+    cx.update(|cx| assert!(skillshard::preferences::get(cx).projects.is_empty()));
+}
+
 /// Open the window on `scopes`, with `installed` standing in for the agents
 /// detected on this machine.
 fn open_with_agents(

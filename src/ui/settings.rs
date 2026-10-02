@@ -8,6 +8,7 @@ use crate::agents::Agent;
 use crate::paths;
 use crate::preferences::{self, Appearance, Preferences};
 use crate::themes;
+use crate::usage::Status;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::setting::{
@@ -18,8 +19,15 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use std::path::PathBuf;
 
+#[path = "source_settings.rs"]
+mod sources;
+#[path = "tracking_settings.rs"]
+mod tracking;
+
 pub enum SettingsEvent {
     Close,
+    RebuildHistory,
+    ResumeRebuild,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsDialog {}
@@ -28,11 +36,24 @@ pub struct SettingsDialog {
     /// Agents offered as install defaults: those on this machine, plus any
     /// already chosen.
     agents: Vec<&'static Agent>,
+    usage_status: Status,
+    confirming_rebuild: bool,
+    source_form: sources::SourceForm,
 }
 
 impl SettingsDialog {
-    pub fn new(agents: Vec<&'static Agent>) -> Self {
-        Self { agents }
+    pub fn new(agents: Vec<&'static Agent>, window: &mut Window, cx: &mut App) -> Self {
+        Self {
+            agents,
+            usage_status: Status::default(),
+            confirming_rebuild: false,
+            source_form: sources::SourceForm::new(window, cx),
+        }
+    }
+
+    pub fn update_usage_status(&mut self, status: Status, cx: &mut Context<Self>) {
+        self.usage_status = status;
+        cx.notify();
     }
 }
 
@@ -69,7 +90,7 @@ fn appearance_page() -> SettingPage {
     SettingPage::new("Appearance")
         .icon(Icon::empty().path("icons/palette.svg"))
         .group(
-            SettingGroup::new().title("Theme").items([
+            SettingGroup::new().items([
                 SettingItem::new(
                     "Mode",
                     dropdown(
@@ -117,11 +138,10 @@ fn appearance_page() -> SettingPage {
 }
 
 fn installing_page(agents: Vec<&'static Agent>) -> SettingPage {
-    SettingPage::new("Installing")
+    SettingPage::new("Installation defaults")
         .icon(Icon::empty().path("icons/download.svg"))
         .group(
             SettingGroup::new()
-                .title("Defaults")
                 .description("Pre-filled in the install dialog; you can still change them there.")
                 .items([
                     SettingItem::new(
@@ -146,7 +166,7 @@ fn render_default_agents(agents: &[&'static Agent], cx: &App) -> impl IntoElemen
         .child(div().text_sm().font_medium().child("Default agents"))
         .child(
             div()
-                .text_xs()
+                .text_sm()
                 .text_color(cx.theme().muted_foreground)
                 .child("With none selected, every agent already in use is chosen."),
         )
@@ -174,20 +194,37 @@ fn render_default_agents(agents: &[&'static Agent], cx: &App) -> impl IntoElemen
         )
 }
 
-fn sources_page() -> SettingPage {
+/// One page group: the sidebar lists a page's groups as sub-items once there
+/// are several, and both kinds of source are configured on the same view.
+fn sources_page(custom_sources: SettingItem) -> SettingPage {
     SettingPage::new("Sources")
         .icon(Icon::empty().path("icons/folder-git-2.svg"))
-        .group(
-            SettingGroup::new()
-                .title("Local repositories")
-                .description(
+        .group(SettingGroup::new().items([
+            custom_sources,
+            SettingItem::render(|_, _, cx| {
+                section(
+                    "Local repositories",
                     "Folders searched for skills on this machine. They are listed \
                      separately from skills.sh when installing.",
+                    render_local_repositories(cx),
+                    cx,
                 )
-                .item(SettingItem::render(|_, _, cx| {
-                    render_local_repositories(cx)
-                })),
+            }),
+        ]))
+}
+
+/// A titled block within a group, for items that need their own heading.
+fn section(title: &str, description: &str, body: impl IntoElement, cx: &App) -> impl IntoElement {
+    v_flex()
+        .gap_2()
+        .child(div().text_sm().font_medium().child(title.to_string()))
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(description.to_string()),
         )
+        .child(body)
 }
 
 fn render_local_repositories(cx: &App) -> impl IntoElement {
@@ -289,7 +326,7 @@ fn updates_page() -> SettingPage {
     SettingPage::new("Updates")
         .icon(Icon::empty().path("icons/refresh-cw.svg"))
         .group(
-            SettingGroup::new().title("Checking").item(
+            SettingGroup::new().item(
                 SettingItem::new(
                     "Check for updates on startup",
                     switch(
@@ -304,6 +341,8 @@ fn updates_page() -> SettingPage {
 
 impl Render for SettingsDialog {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tracking_page = self.tracking_page(cx);
+        let custom_sources = self.custom_sources_item(cx);
         // A full-window scrim; the dialog sits on top of it.
         div()
             .absolute()
@@ -347,8 +386,9 @@ impl Render for SettingsDialog {
                         Settings::new("preferences").sidebar_width(px(200.)).pages([
                             appearance_page(),
                             installing_page(self.agents.clone()),
-                            sources_page(),
+                            sources_page(custom_sources),
                             updates_page(),
+                            tracking_page,
                         ]),
                     )),
             )

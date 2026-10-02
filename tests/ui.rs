@@ -24,7 +24,8 @@ fn init(cx: &mut TestAppContext) {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&path);
-    cx.update(|cx| skillshard::ui::init(path, cx));
+    let usage_directory = path.with_extension("usage-data");
+    cx.update(|cx| skillshard::ui::init_with_usage(path, Ok(usage_directory), Vec::new(), cx));
 }
 
 /// A throwaway project tree containing `names` as canonical skills.
@@ -725,6 +726,119 @@ fn local_repository_skills_are_listed_and_fill_the_form(cx: &mut TestAppContext)
     .unwrap();
 }
 
+/// A committed git repository holding a skill at each of `folders`.
+fn git_repository(tag: &str, folders: &[&str]) -> PathBuf {
+    let repo = std::env::temp_dir().join(format!("skillshard-ui-git-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    for folder in folders {
+        let name = folder.rsplit('/').next().unwrap();
+        std::fs::create_dir_all(repo.join(folder)).unwrap();
+        std::fs::write(
+            repo.join(folder).join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: about {name}\n---\n"),
+        )
+        .unwrap();
+    }
+    for args in [
+        &["init", "--quiet"][..],
+        &["add", "."],
+        &["commit", "--quiet", "-m", "skills"],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
+    repo
+}
+
+#[gpui_kit::test]
+fn a_custom_source_is_one_click_away_and_lists_its_skills(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("custom-source", &["alpha"]);
+    let repo = git_repository("browse", &["skills/pdf-tools", "git-helper"]);
+    let source = repo.display().to_string();
+    cx.update(|cx| {
+        skillshard::preferences::update(cx, |p| {
+            p.add_custom_source(&source, "Team skills").unwrap()
+        })
+    });
+    let (handle, _view) = open(&scope, 1180., cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("install", cx);
+        window.render_frame(cx);
+        window.click(("custom-source", 0usize), cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("source").value(),
+            Some(source.as_str()),
+            "one click selects the source"
+        );
+    })
+    .unwrap();
+    // The repository is cloned in the background.
+    cx.run_until_parked();
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("source-skill-1", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("source").value(), Some(source.as_str()));
+        assert_eq!(
+            window.find("skills").value(),
+            Some("pdf-tools"),
+            "picking a listed skill installs just that one"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn custom_sources_are_added_from_settings(cx: &mut TestAppContext) {
+    init(cx);
+    let scope = fixture("add-source", &["alpha"]);
+    let (handle, _view) = open(&scope, 1180., cx);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("open-settings", cx);
+        window.render_frame(cx);
+        // GPUI Kit identifies sidebar items by group and page position.
+        window.click("0-2", cx);
+        window.render_frame(cx);
+
+        window.click("new-source", cx);
+        window.input("not a repo", cx);
+        window.click("add-source", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("source-error").is_some(),
+            "refusal is shown"
+        );
+        assert!(skillshard::preferences::get(cx).custom_sources.is_empty());
+
+        window.click("new-source", cx);
+        window.press("ctrl-a", cx);
+        window.input("acme/private-skills", cx);
+        window.click("new-source-name", cx);
+        window.input("Team", cx);
+        window.click("add-source", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("source-error").is_none(), "refusal clears");
+        let sources = &skillshard::preferences::get(cx).custom_sources;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source, "acme/private-skills");
+        assert_eq!(sources[0].label(), "Team");
+        assert_eq!(window.find("new-source").value(), Some(""), "form resets");
+    })
+    .unwrap();
+}
+
 /// A second fixture project, saved in preferences so it appears in the
 /// sidebar after the first.
 fn saved_project(tag: &str, skill: &str, cx: &mut TestAppContext) -> PathBuf {
@@ -1392,4 +1506,62 @@ fn without_editors_edit_is_a_plain_button(cx: &mut TestAppContext) {
         assert!(window.try_find("edit-in").is_none(), "no menu to offer");
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_usage_tab_replaces_the_panes_beside_the_sidebar_and_follows_its_scope(
+    cx: &mut TestAppContext,
+) {
+    init(cx);
+    let first = fixture("usage-first", &["alpha"]);
+    let second = fixture("usage-second", &["beta"]);
+
+    let handle = cx.open_window(size(px(1180.), px(760.)), |window, cx| {
+        let scopes = vec![first.clone(), second.clone()];
+        let view = cx.new(|cx| Skillshard::with_scopes(scopes, window, cx));
+        Root::new(view, window, cx)
+    });
+
+    let mut step = |action: &dyn Fn(&mut gpui_kit::Window, &mut gpui_kit::App)| {
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            action(window, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    let context = |window: &mut gpui_kit::Window| {
+        window
+            .find("usage-context")
+            .label()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    step(&|window, cx| window.within("main-view").click(1usize, cx));
+    step(&|window, _| {
+        assert!(window.try_find("usage-view").is_some(), "usage is shown");
+        assert!(window.try_find("row-alpha").is_none(), "the list gives way");
+        assert!(window.try_find("scope-1").is_some(), "the sidebar stays");
+        assert!(
+            context(window).starts_with(&first.label()),
+            "{}",
+            context(window)
+        );
+    });
+
+    step(&|window, cx| window.click("scope-1", cx));
+    step(&|window, _| {
+        assert!(
+            context(window).starts_with(&second.label()),
+            "{}",
+            context(window)
+        );
+    });
+
+    step(&|window, cx| window.within("main-view").click(0usize, cx));
+    step(&|window, _| {
+        assert!(window.try_find("usage-view").is_none());
+        assert!(window.try_find("row-beta").is_some(), "back on the skills");
+    });
 }

@@ -17,6 +17,55 @@ pub enum Appearance {
     Dark,
 }
 
+/// The rolling retention window for local skill activation history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub enum TrackingDays {
+    Seven,
+    Fifteen,
+    #[default]
+    Thirty,
+    Sixty,
+}
+
+impl TrackingDays {
+    pub const ALL: [Self; 4] = [Self::Seven, Self::Fifteen, Self::Thirty, Self::Sixty];
+
+    pub fn days(self) -> u8 {
+        self.into()
+    }
+
+    pub fn cutoff(self, now: i64) -> i64 {
+        const MILLISECONDS_PER_DAY: i64 = 86_400_000;
+        now.saturating_sub(i64::from(self.days()) * MILLISECONDS_PER_DAY)
+    }
+}
+
+impl From<TrackingDays> for u8 {
+    fn from(value: TrackingDays) -> Self {
+        match value {
+            TrackingDays::Seven => 7,
+            TrackingDays::Fifteen => 15,
+            TrackingDays::Thirty => 30,
+            TrackingDays::Sixty => 60,
+        }
+    }
+}
+
+impl TryFrom<u8> for TrackingDays {
+    type Error = String;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            7 => Ok(Self::Seven),
+            15 => Ok(Self::Fifteen),
+            30 => Ok(Self::Thirty),
+            60 => Ok(Self::Sixty),
+            _ => Err("tracking_days must be 7, 15, 30, or 60".into()),
+        }
+    }
+}
+
 /// A project shown in the sidebar, and how it looks there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
@@ -27,6 +76,23 @@ pub struct Project {
     /// Palette colour name, e.g. `"blue"`; `None` uses the text colour.
     #[serde(default)]
     pub color: Option<String>,
+}
+
+/// A git repository the user added as a skill source, shown as a shortcut in
+/// the install dialog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomSource {
+    /// What `skills add` is given: `owner/repo` or a git URL.
+    pub source: String,
+    /// Shown in place of the source; `None` shows the source itself.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl CustomSource {
+    pub fn label(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.source)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,7 +110,12 @@ pub struct Preferences {
     pub install_copy: bool,
     /// Folders searched for skills that live on this machine.
     pub local_repositories: Vec<PathBuf>,
+    /// Git repositories, often private, offered as one-click sources.
+    pub custom_sources: Vec<CustomSource>,
     pub check_updates_on_startup: bool,
+    /// Import local agent histories only after the user opts in.
+    pub tracking_enabled: bool,
+    pub tracking_days: TrackingDays,
     /// Projects kept in the sidebar between runs.
     pub projects: Vec<Project>,
 }
@@ -73,6 +144,24 @@ impl Preferences {
     pub fn remove_project(&mut self, path: &Path) {
         self.projects.retain(|p| p.path != path);
     }
+
+    /// Add a custom source, rejecting one that is malformed or already listed.
+    ///
+    /// A blank `name` means the source is shown as itself.
+    pub fn add_custom_source(&mut self, source: &str, name: &str) -> Result<(), String> {
+        let source = source.trim();
+        crate::custom_sources::clone_url(source)?;
+        if self.custom_sources.iter().any(|s| s.source == source) {
+            return Err(format!("{source} is already a source"));
+        }
+
+        let name = name.trim();
+        self.custom_sources.push(CustomSource {
+            source: source.to_string(),
+            name: (!name.is_empty()).then(|| name.to_string()),
+        });
+        Ok(())
+    }
 }
 
 impl Default for Preferences {
@@ -85,7 +174,10 @@ impl Default for Preferences {
             install_agents: Vec::new(),
             install_copy: false,
             local_repositories: Vec::new(),
+            custom_sources: Vec::new(),
             check_updates_on_startup: true,
+            tracking_enabled: false,
+            tracking_days: TrackingDays::default(),
             projects: Vec::new(),
         }
     }
@@ -158,6 +250,26 @@ pub fn update(cx: &mut App, change: impl FnOnce(&mut Preferences)) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tracking_defaults_to_opt_in_and_thirty_days() {
+        let prefs: Preferences = serde_json::from_str("{}").unwrap();
+        assert!(!prefs.tracking_enabled);
+        assert_eq!(prefs.tracking_days, TrackingDays::Thirty);
+    }
+
+    #[test]
+    fn tracking_windows_validate_and_round_trip_as_numbers() {
+        for window in TrackingDays::ALL {
+            let text = serde_json::to_string(&window).unwrap();
+            assert_eq!(text, window.days().to_string());
+            assert_eq!(serde_json::from_str::<TrackingDays>(&text).unwrap(), window);
+            assert_eq!(window.cutoff(0), -i64::from(window.days()) * 86_400_000);
+        }
+        for invalid in ["0", "14", "31", "90", "-1", "\"30\"", "null"] {
+            assert!(serde_json::from_str::<TrackingDays>(invalid).is_err());
+        }
+    }
+
     fn temp_file(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("skillshard-prefs-{tag}-{}", std::process::id()));
@@ -173,6 +285,12 @@ mod tests {
             dark_theme: "Tokyo Night".into(),
             install_agents: vec!["claude-code".into()],
             local_repositories: vec![PathBuf::from("/src/skills")],
+            custom_sources: vec![CustomSource {
+                source: "acme/private-skills".into(),
+                name: Some("Team skills".into()),
+            }],
+            tracking_enabled: true,
+            tracking_days: TrackingDays::Sixty,
             projects: vec![Project {
                 path: PathBuf::from("/work/app"),
                 icon: Some("rocket".into()),
@@ -195,6 +313,45 @@ mod tests {
 
         prefs.remove_project(path);
         assert!(prefs.project(path).is_none());
+    }
+
+    #[test]
+    fn custom_sources_are_trimmed_validated_and_listed_once() {
+        let mut prefs = Preferences::default();
+        prefs
+            .add_custom_source(" acme/private-skills ", " Team skills ")
+            .unwrap();
+        prefs
+            .add_custom_source("git@github.com:acme/other.git", "  ")
+            .unwrap();
+
+        assert_eq!(
+            prefs.custom_sources,
+            [
+                CustomSource {
+                    source: "acme/private-skills".into(),
+                    name: Some("Team skills".into()),
+                },
+                CustomSource {
+                    source: "git@github.com:acme/other.git".into(),
+                    name: None,
+                },
+            ]
+        );
+        assert_eq!(prefs.custom_sources[0].label(), "Team skills");
+        assert_eq!(
+            prefs.custom_sources[1].label(),
+            "git@github.com:acme/other.git"
+        );
+
+        let duplicate = prefs.add_custom_source("acme/private-skills", "Again");
+        assert!(duplicate.unwrap_err().contains("already"));
+        assert!(prefs.add_custom_source("not a repo", "").is_err());
+        assert_eq!(
+            prefs.custom_sources.len(),
+            2,
+            "rejected sources are not added"
+        );
     }
 
     #[test]

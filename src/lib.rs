@@ -8,6 +8,7 @@
 
 pub mod agents;
 pub mod assets;
+pub mod custom_sources;
 pub mod editors;
 pub mod frontmatter;
 pub mod local_repos;
@@ -24,3 +25,4 @@ pub mod themes;
 pub mod tokens;
 pub mod ui;
 pub mod updates;
+pub mod usage;

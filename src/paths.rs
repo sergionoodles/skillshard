@@ -3,6 +3,44 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+/// Platform-specific application data resolution, separated from the environment
+/// so tests do not change process-wide variables.
+pub fn usage_data_dir_for(
+    platform: &str,
+    home: Option<&Path>,
+    data_home: Option<&Path>,
+    local_app_data: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let absolute = |path: Option<&Path>| {
+        path.filter(|path| path.is_absolute())
+            .map(Path::to_path_buf)
+    };
+    let base = match platform {
+        "windows" => absolute(local_app_data),
+        "macos" => absolute(home).map(|home| home.join("Library/Application Support")),
+        _ => absolute(data_home).or_else(|| absolute(home).map(|home| home.join(".local/share"))),
+    };
+    base.map(|base| base.join("skillshard")).ok_or_else(|| {
+        "could not resolve an absolute application data directory for skill usage".into()
+    })
+}
+
+pub fn usage_data_dir() -> Result<PathBuf, String> {
+    let home = home();
+    let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    usage_data_dir_for(
+        std::env::consts::OS,
+        Some(&home),
+        data_home.as_deref(),
+        local_app_data.as_deref(),
+    )
+}
+
+pub fn usage_database_path() -> Result<PathBuf, String> {
+    usage_data_dir().map(|directory| directory.join("usage.sqlite3"))
+}
+
 /// The user's home directory.
 pub fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -68,4 +106,34 @@ pub fn which_in(name: &str, path: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path)
         .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn usage_data_respects_platform_locations_and_absolute_overrides() {
+        let home = std::env::temp_dir().join("skillshard-path-test");
+        let data_home = home.join("data");
+        let local_app_data = home.join("local");
+        assert_eq!(
+            usage_data_dir_for("linux", Some(&home), None, None).unwrap(),
+            home.join(".local/share/skillshard")
+        );
+        assert_eq!(
+            usage_data_dir_for("linux", Some(&home), Some(&data_home), None).unwrap(),
+            data_home.join("skillshard")
+        );
+        assert_eq!(
+            usage_data_dir_for("macos", Some(&home), None, None).unwrap(),
+            home.join("Library/Application Support/skillshard")
+        );
+        assert_eq!(
+            usage_data_dir_for("windows", None, None, Some(&local_app_data)).unwrap(),
+            local_app_data.join("skillshard")
+        );
+        assert!(usage_data_dir_for("linux", None, Some(Path::new("relative")), None).is_err());
+        assert!(usage_data_dir_for("windows", Some(&home), None, None).is_err());
+    }
 }

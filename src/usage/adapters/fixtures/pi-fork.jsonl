@@ -1,0 +1,3 @@
+{"type":"session","version":3,"id":"synthetic-pi-fork","timestamp":"2026-09-30T11:00:00Z","cwd":"/tmp/skillshard-synthetic-project","parentSession":"/tmp/synthetic-parent.jsonl"}
+{"type":"message","id":"pi-calls","parentId":"pi-attachment","timestamp":"2026-09-30T10:00:03Z","message":{"role":"assistant","model":"synthetic-model","content":[{"type":"toolCall","id":"pi-read","name":"read","arguments":{"path":"./example/SKILL.md"}}],"timestamp":1790762403000}}
+{"type":"message","id":"pi-fork-new","parentId":"pi-calls","timestamp":"2026-09-30T11:00:01Z","message":{"role":"assistant","model":"synthetic-model","content":[{"type":"toolCall","id":"pi-fork-read","name":"read","arguments":{"path":"/tmp/fork-new/SKILL.md"}}],"timestamp":1790766001000}}

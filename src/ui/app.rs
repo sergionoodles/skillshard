@@ -14,6 +14,7 @@ use gpui_kit::component::progress::Progress;
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::*;
@@ -23,8 +24,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[path = "app_usage.rs"]
+mod usage_integration;
+
 /// Width of both side panes: the scope sidebar and the detail pane.
-const SIDE_PANE_WIDTH: f32 = 300.;
+pub(crate) const SIDE_PANE_WIDTH: f32 = 300.;
 /// Below this, the list column loses the worded update badge and shows an
 /// arrow instead.
 const COMPACT_LIST_WIDTH: f32 = 460.;
@@ -37,8 +41,20 @@ pub struct Activity {
     pub failed: bool,
 }
 
+/// What the panes right of the sidebar show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum MainView {
+    /// The skill list and the selected skill's detail.
+    #[default]
+    Skills,
+    /// Usage statistics and their filters.
+    Usage,
+}
+
 /// Root view.
 pub struct Skillshard {
+    usage: usage_integration::Runtime,
+    main_view: MainView,
     /// Scopes the user can switch between: global plus any opened project.
     scopes: Vec<Scope>,
     active_scope: usize,
@@ -160,11 +176,14 @@ impl Skillshard {
             cx.observe_global_in::<preferences::Store>(window, |this, window, cx| {
                 themes::apply(window, cx);
                 this.report_preferences_error(cx);
+                this.configure_usage(false, cx);
                 cx.notify();
             }),
         ];
 
         let mut this = Self {
+            usage: usage_integration::Runtime::new(cx),
+            main_view: MainView::default(),
             scopes,
             active_scope: 0,
             skills: Vec::new(),
@@ -189,6 +208,7 @@ impl Skillshard {
         };
         this.report_preferences_error(cx);
         this.reload(cx);
+        this.start_usage_updates(cx);
         if preferences::get(cx).check_updates_on_startup {
             this.check_updates(cx);
         }
@@ -275,6 +295,9 @@ impl Skillshard {
             }
         }
         self.fetch_install_counts(cx);
+        self.configure_usage(false, cx);
+        self.refresh_usage_installs(cx);
+        self.sync_usage_scope(cx);
         cx.notify();
     }
 
@@ -319,7 +342,10 @@ impl Skillshard {
             ops::disable(&skill).map(|_| "disabled")
         };
         match result {
-            Ok(verb) => self.log(format!("{name} {verb}"), false),
+            Ok(verb) => {
+                self.record_usage_toggle(skill);
+                self.log(format!("{name} {verb}"), false);
+            }
             Err(e) => self.log(format!("{name}: {e}"), true),
         }
         self.reload(cx);
@@ -550,7 +576,15 @@ impl Skillshard {
             .items_center()
             .border_b_1()
             .border_color(cx.theme().border)
-            .child(h_flex().flex_1().flex_basis(px(0.)).child(wordmark(cx)))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .flex_basis(px(0.))
+                    .gap_4()
+                    .items_center()
+                    .child(wordmark(cx))
+                    .child(self.render_view_switch(cx)),
+            )
             .child(Input::new(&self.search).id("search").small().w(px(360.)))
             .child(
                 h_flex()
@@ -594,6 +628,30 @@ impl Skillshard {
                             ),
                     ),
             )
+    }
+
+    /// Skills or usage: swaps everything right of the sidebar, like a tab.
+    fn render_view_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let views = [MainView::Skills, MainView::Usage];
+        let selected = views
+            .iter()
+            .position(|view| *view == self.main_view)
+            .unwrap_or_default();
+        TabBar::new("main-view")
+            .segmented()
+            .small()
+            .selected_index(selected)
+            .child(Tab::new().label("Skills"))
+            .child(Tab::new().label("Usage"))
+            .on_click(cx.listener(
+                move |this, index: &usize, window, cx| match views.get(*index) {
+                    Some(MainView::Usage) => this.show_usage(window, cx),
+                    Some(MainView::Skills) | None => {
+                        this.main_view = MainView::Skills;
+                        cx.notify();
+                    }
+                },
+            ))
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1027,6 +1085,7 @@ impl Skillshard {
                     .test_support(),
             )
             .child(self.render_detail_controls(&skill, shared, togglable, inherited, cx))
+            .child(self.render_skill_usage(&skill, cx))
             .into_any_element()
     }
 
@@ -1474,7 +1533,7 @@ fn nav_row(id: impl Into<SharedString>, cx: &App) -> Stateful<Div> {
 }
 
 /// Small uppercase heading above a group of controls.
-fn section_label(text: &str, cx: &App) -> impl IntoElement {
+pub(crate) fn section_label(text: &str, cx: &App) -> impl IntoElement {
     div()
         .px_1()
         .pb_1()
@@ -1892,8 +1951,12 @@ impl Render for Skillshard {
                     .flex_1()
                     .overflow_hidden()
                     .child(self.render_sidebar(cx))
-                    .child(self.render_list(compact, cx))
-                    .child(self.render_detail(cx)),
+                    .map(|this| match (self.main_view, self.usage.panel.clone()) {
+                        (MainView::Usage, Some(panel)) => this.child(panel),
+                        _ => this
+                            .child(self.render_list(compact, cx))
+                            .child(self.render_detail(cx)),
+                    }),
             )
             .child(self.render_status(cx))
             .children(self.install.clone())
@@ -1962,7 +2025,7 @@ impl Skillshard {
         cx.notify();
     }
 
-    fn open_settings(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut agents = self.shown_agents();
         let extra = self.installed.iter().copied().chain(
             preferences::get(cx)
@@ -1979,12 +2042,16 @@ impl Skillshard {
         agents.retain(|a| a.in_cli());
         agents.sort_by_key(|a| a.display);
 
-        let dialog = cx.new(|_| super::settings::SettingsDialog::new(agents));
+        let dialog = cx.new(|cx| super::settings::SettingsDialog::new(agents, window, cx));
+        let status = self.usage.current_view().status;
+        dialog.update(cx, |dialog, cx| dialog.update_usage_status(status, cx));
         cx.subscribe(&dialog, |this, _, event, cx| match event {
             super::settings::SettingsEvent::Close => {
                 this.settings = None;
                 cx.notify();
             }
+            super::settings::SettingsEvent::RebuildHistory
+            | super::settings::SettingsEvent::ResumeRebuild => this.configure_usage(true, cx),
         })
         .detach();
         self.settings = Some(dialog);
@@ -2259,6 +2326,9 @@ impl Skillshard {
             format!("{} {name} to {}", transfer.verb(), to.label()),
             steps,
             move |this, cx| {
+                if transfer == Transfer::Move {
+                    this.record_usage_move(skill, to.clone(), cx);
+                }
                 if let Scope::Project(path) = to {
                     this.offer_project(path, cx);
                 }

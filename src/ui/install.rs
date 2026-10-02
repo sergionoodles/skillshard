@@ -9,7 +9,7 @@
 use crate::agents::Agent;
 use crate::local_repos::{self, LocalSkill};
 use crate::model::Scope;
-use crate::preferences;
+use crate::preferences::{self, CustomSource};
 use crate::registry::{self, Risk, SearchHit, SkillAudit};
 use crate::skills_cli::InstallRequest;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -23,6 +23,9 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use std::collections::BTreeMap;
+
+#[path = "install_sources.rs"]
+mod sources;
 
 /// What the dialog reports back to the main window.
 pub enum InstallEvent {
@@ -55,6 +58,9 @@ pub struct InstallDialog {
     /// Skills found in the configured local repositories, and any roots that
     /// could not be read.
     local: Lookup<(Vec<LocalSkill>, Vec<String>)>,
+    /// Repositories the user added as sources, offered as one-click shortcuts.
+    custom_sources: Vec<CustomSource>,
+    browsed: Option<sources::Browsed>,
     audit: Lookup<BTreeMap<String, SkillAudit>>,
     /// Set once the user has seen a review for the current source.
     reviewed_source: Option<String>,
@@ -106,6 +112,8 @@ impl InstallDialog {
             } else {
                 Lookup::Idle
             },
+            custom_sources: prefs.custom_sources,
+            browsed: None,
             audit: Lookup::Idle,
             reviewed_source: None,
         }
@@ -244,16 +252,19 @@ fn default_agents(
         .collect()
 }
 
+/// Whether a skill's name or description contains `query`, ignoring case.
+fn matches_query(name: &str, description: &str, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty()
+        || name.to_lowercase().contains(&query)
+        || description.to_lowercase().contains(&query)
+}
+
 /// Local skills whose name or description contains `query`.
 fn matching_local<'a>(skills: &'a [LocalSkill], query: &str) -> Vec<&'a LocalSkill> {
-    let query = query.trim().to_lowercase();
     skills
         .iter()
-        .filter(|s| {
-            query.is_empty()
-                || s.name.to_lowercase().contains(&query)
-                || s.description.to_lowercase().contains(&query)
-        })
+        .filter(|s| matches_query(&s.name, &s.description, query))
         .collect()
 }
 
@@ -309,11 +320,7 @@ impl InstallDialog {
             .child(match &self.local {
                 Lookup::Idle => div().into_any_element(),
                 Lookup::Loading => loading("Looking through folders…"),
-                Lookup::Failed(e) => div()
-                    .text_xs()
-                    .text_color(cx.theme().danger)
-                    .child(e.clone())
-                    .into_any_element(),
+                Lookup::Failed(e) => failure(e, cx),
                 Lookup::Ready((skills, errors)) => {
                     let matches = matching_local(skills, &query);
                     v_flex()
@@ -362,11 +369,7 @@ impl InstallDialog {
             .child(match &self.results {
                 Lookup::Idle => empty_note("Search the public directory.", cx).into_any_element(),
                 Lookup::Loading => loading("Searching…"),
-                Lookup::Failed(e) => div()
-                    .text_xs()
-                    .text_color(cx.theme().danger)
-                    .child(e.clone())
-                    .into_any_element(),
+                Lookup::Failed(e) => failure(e, cx),
                 Lookup::Ready(hits) if hits.is_empty() => {
                     empty_note("Nothing found.", cx).into_any_element()
                 }
@@ -491,6 +494,9 @@ impl Render for InstallDialog {
                     .border_1()
                     .border_color(cx.theme().border)
                     .child(div().text_lg().font_semibold().child("Install a skill"))
+                    .when(!self.custom_sources.is_empty(), |this| {
+                        this.child(self.render_custom_sources(cx))
+                    })
                     .child(self.render_search(cx))
                     .child(Separator::horizontal())
                     .child(labelled(
@@ -641,6 +647,14 @@ fn empty_note(text: &str, cx: &App) -> impl IntoElement {
         .text_xs()
         .text_color(cx.theme().muted_foreground)
         .child(text.to_string())
+}
+
+fn failure(error: &str, cx: &App) -> AnyElement {
+    div()
+        .text_xs()
+        .text_color(cx.theme().danger)
+        .child(error.to_string())
+        .into_any_element()
 }
 
 fn loading(text: &'static str) -> AnyElement {
